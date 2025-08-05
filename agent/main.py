@@ -78,18 +78,88 @@ async def run():
                     model=AZURE_OPENAI_MODEL,
                     messages=messages,
                     tools=available_tools,
+                    stream=True,
                 )
 
-                # Process the model's response
-                response_message = response.choices[0].message
-                messages.append(response_message)
+                # Process the streaming response
+                response_message = {"role": "assistant", "content": "", "tool_calls": []}
+                current_tool_call = None
+                
+                for chunk in response:
+                    if chunk.choices and chunk.choices[0].delta:
+                        delta = chunk.choices[0].delta
+                        
+                        # Handle content streaming
+                        if delta.content:
+                            if not response_message["content"]:
+                                print("\nAssistant: ", end="", flush=True)
+                            print(delta.content, end="", flush=True)
+                            response_message["content"] += delta.content
+                        
+                        # Handle tool call streaming
+                        if delta.tool_calls:
+                            for tool_call in delta.tool_calls:
+                                if tool_call.index is not None:
+                                    # Ensure we have enough tool calls in our list
+                                    while len(response_message["tool_calls"]) <= tool_call.index:
+                                        response_message["tool_calls"].append({
+                                            "id": "",
+                                            "type": "function",
+                                            "function": {"name": "", "arguments": ""}
+                                        })
+                                    
+                                    current_tool_call = response_message["tool_calls"][tool_call.index]
+                                    
+                                    if tool_call.id:
+                                        current_tool_call["id"] = tool_call.id
+                                    if tool_call.function:
+                                        if tool_call.function.name:
+                                            current_tool_call["function"]["name"] = tool_call.function.name
+                                        if tool_call.function.arguments:
+                                            current_tool_call["function"]["arguments"] += tool_call.function.arguments
+
+                # Clean up empty content if we only had tool calls
+                if not response_message["content"] and response_message["tool_calls"]:
+                    response_message["content"] = None
+                
+                # Clean up empty tool calls
+                if not any(tc["function"]["name"] for tc in response_message["tool_calls"]):
+                    response_message["tool_calls"] = None
+                
+                # Convert to the format expected by the messages list
+                if response_message["tool_calls"]:
+                    # Convert our format to OpenAI's expected format
+                    formatted_tool_calls = []
+                    for tc in response_message["tool_calls"]:
+                        if tc["function"]["name"]:  # Only include valid tool calls
+                            formatted_tool_calls.append({
+                                "id": tc["id"],
+                                "type": "function", 
+                                "function": {
+                                    "name": tc["function"]["name"],
+                                    "arguments": tc["function"]["arguments"]
+                                }
+                            })
+                    
+                    response_dict = {
+                        "role": "assistant",
+                        "content": response_message["content"],
+                        "tool_calls": formatted_tool_calls if formatted_tool_calls else None
+                    }
+                else:
+                    response_dict = {
+                        "role": "assistant", 
+                        "content": response_message["content"]
+                    }
+                    
+                messages.append(response_dict)
 
                 # Handle function calls
-                if response_message.tool_calls:
-                    for tool_call in response_message.tool_calls:
+                if response_dict.get("tool_calls"):
+                    for tool_call in response_dict["tool_calls"]:
                         try:
-                            function_name = tool_call.function.name
-                            function_args = json.loads(tool_call.function.arguments)
+                            function_name = tool_call["function"]["name"]
+                            function_args = json.loads(tool_call["function"]["arguments"])
                             
                             # Call the tool using Azure MCP Server
                             content = await mcp_server.call_tool(function_name, function_args)
@@ -97,34 +167,39 @@ async def run():
                             # Add the tool response to messages
                             messages.append(
                                 {
-                                    "tool_call_id": tool_call.id,
+                                    "tool_call_id": tool_call["id"],
                                     "role": "tool",
                                     "name": function_name,
                                     "content": content,
                                 }
                             )
                         except Exception as e:
-                            logger.error(f"Error calling tool {tool_call.function.name}: {e}")
+                            logger.error(f"Error calling tool {function_name}: {e}")
                             messages.append(
                                 {
-                                    "tool_call_id": tool_call.id,
+                                    "tool_call_id": tool_call["id"],
                                     "role": "tool",
-                                    "name": tool_call.function.name,
+                                    "name": function_name,
                                     "content": f"Error calling tool: {str(e)}",
                                 }
                             )
 
-                # Get the final response from the model
-                final_response = client.chat.completions.create(
-                    model=AZURE_OPENAI_MODEL,
-                    messages=messages,
-                    tools=available_tools,
-                )
+                    # Get the final response from the model after tool calls
+                    final_response = client.chat.completions.create(
+                        model=AZURE_OPENAI_MODEL,
+                        messages=messages,
+                        tools=available_tools,
+                        stream=True,
+                    )
 
-                # Print the response
-                response_content = final_response.choices[0].message.content
-                if response_content:
-                    print("\nAssistant:", response_content)
+                    # Stream the final response
+                    print("\nAssistant: ", end="", flush=True)
+                    for chunk in final_response:
+                        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                            print(chunk.choices[0].delta.content, end="", flush=True)
+                    print()  # New line after streaming
+                elif response_dict.get("content"):
+                    print()  # New line after streaming if we had content but no tool calls
                 
             except KeyboardInterrupt:
                 print("\nExiting...")
