@@ -4,10 +4,10 @@ from azure_mcp_server import AzureMCPServer
 import json, os, logging, asyncio, sys
 from dotenv import load_dotenv
 
-# Setup logging with more detail
+# Setup logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.WARNING,
+    format='%(levelname)s: %(message)s'
 )
 logger = logging.getLogger(__name__)
 load_dotenv()
@@ -24,8 +24,6 @@ if AZURE_OPENAI_ENDPOINT and not AZURE_OPENAI_ENDPOINT.startswith(('http://', 'h
 if not AZURE_OPENAI_ENDPOINT:
     raise ValueError("AZURE_OPENAI_ENDPOINT environment variable is not set")
 
-logger.info(f"Using Azure OpenAI endpoint: {AZURE_OPENAI_ENDPOINT}")
-
 # Initialize Azure credentials
 credential = DefaultAzureCredential()
 token_provider = get_bearer_token_provider(
@@ -35,22 +33,7 @@ token_provider = get_bearer_token_provider(
 # Debug: Check which credential is being used
 try:
     token = credential.get_token("https://cognitiveservices.azure.com/.default")
-    logger.info(f"Successfully authenticated. Token expires at: {token.expires_on}")
-    
-    # Try to identify the credential type
-    from azure.identity import EnvironmentCredential, AzureCliCredential, ManagedIdentityCredential
-    for cred_type, cred_name in [
-        (EnvironmentCredential, "Environment (Service Principal)"),
-        (AzureCliCredential, "Azure CLI"),
-        (ManagedIdentityCredential, "Managed Identity")
-    ]:
-        try:
-            test_cred = cred_type()
-            test_token = test_cred.get_token("https://cognitiveservices.azure.com/.default")
-            logger.info(f"Using credential type: {cred_name}")
-            break
-        except:
-            continue
+    # Suppress verbose credential checking
 except Exception as e:
     logger.error(f"Authentication failed: {e}")
 
@@ -68,9 +51,12 @@ async def run():
     
     async with mcp_server.create_session():
         # Display available tools
-        print("\nAvailable Azure MCP tools:")
-        for tool_name, tool_desc in mcp_server.list_tools():
-            print(f"  - {tool_name}: {tool_desc}")
+        tools = mcp_server.list_tools()
+        print(f"Loaded {len(tools)} Azure MCP tools:")
+        for tool_name, tool_desc in tools:
+            # Show just the first sentence of the description
+            short_desc = tool_desc.split('.')[0] if '.' in tool_desc else tool_desc[:60]
+            print(f"  • {tool_name}: {short_desc}")
 
         # Get formatted tools for OpenAI
         available_tools = mcp_server.formatted_tools
@@ -88,7 +74,6 @@ async def run():
                 messages.append({"role": "user", "content": user_input})
 
                 # First API call with tool configuration
-                logger.info("Sending request to Azure OpenAI...")
                 response = client.chat.completions.create(
                     model=AZURE_OPENAI_MODEL,
                     messages=messages,
@@ -101,8 +86,6 @@ async def run():
 
                 # Handle function calls
                 if response_message.tool_calls:
-                    logger.info(f"Model requested {len(response_message.tool_calls)} tool call(s)")
-                    
                     for tool_call in response_message.tool_calls:
                         try:
                             function_name = tool_call.function.name
@@ -110,8 +93,6 @@ async def run():
                             
                             # Call the tool using Azure MCP Server
                             content = await mcp_server.call_tool(function_name, function_args)
-                            
-                            logger.info(f"Tool {function_name} returned: {content[:200]}...")
                             
                             # Add the tool response to messages
                             messages.append(
@@ -123,7 +104,7 @@ async def run():
                                 }
                             )
                         except Exception as e:
-                            logger.error(f"Error calling tool {tool_call.function.name}: {e}", exc_info=True)
+                            logger.error(f"Error calling tool {tool_call.function.name}: {e}")
                             messages.append(
                                 {
                                     "tool_call_id": tool_call.id,
@@ -132,11 +113,8 @@ async def run():
                                     "content": f"Error calling tool: {str(e)}",
                                 }
                             )
-                else:
-                    logger.info("No tool calls were made by the model")
 
                 # Get the final response from the model
-                logger.info("Getting final response from Azure OpenAI...")
                 final_response = client.chat.completions.create(
                     model=AZURE_OPENAI_MODEL,
                     messages=messages,
@@ -152,7 +130,6 @@ async def run():
                 print("\nExiting...")
                 break
             except Exception as e:
-                logger.error(f"Error in conversation loop: {e}", exc_info=True)
                 print(f"An error occurred: {e}")
                 
                 # Try to recover by resetting the conversation if it's a connection error
@@ -167,5 +144,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nGoodbye!")
     except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
+        print(f"Fatal error: {e}")
         sys.exit(1)

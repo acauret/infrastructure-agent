@@ -153,13 +153,20 @@ class AzureMCPServer:
         """Close the MCP session and clean up resources"""
         try:
             if self._session:
-                await self._session.__aexit__(None, None, None)
-                self._session = None
+                try:
+                    await self._session.__aexit__(None, None, None)
+                except Exception as e:
+                    logger.warning(f"Error closing session: {e}")
+                finally:
+                    self._session = None
             
             if self._stdio_context:
-                # Close stdio connections properly
-                await self._stdio_context.__aexit__(None, None, None)
-                self._stdio_context = None
+                try:
+                    await self._stdio_context.__aexit__(None, None, None)
+                except Exception as e:
+                    logger.warning(f"Error closing stdio context: {e}")
+                finally:
+                    self._stdio_context = None
                 
             self._read = None
             self._write = None
@@ -168,7 +175,7 @@ class AzureMCPServer:
             
         except Exception as e:
             logger.error(f"Error closing Azure MCP Server: {e}")
-            raise
+            # Don't re-raise during cleanup
 
     @asynccontextmanager
     async def create_session(self):
@@ -177,4 +184,8 @@ class AzureMCPServer:
             await self.initialize()
             yield self
         finally:
-            await self.close()
+            try:
+                await self.close()
+            except Exception as e:
+                logger.warning(f"Error during cleanup: {e}")
+                # Continue with cleanup, don't raise
