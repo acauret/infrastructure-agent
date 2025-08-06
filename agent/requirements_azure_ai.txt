@@ -1,0 +1,7 @@
+# Azure AI Inference specific requirements
+azure-ai-inference>=1.0.0b4
+azure-core>=1.29.0
+azure-identity>=1.15.0
+
+# Shared requirements (from main requirements.txt)
+python-dotenv>=1.0.0
