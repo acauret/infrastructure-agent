@@ -1,21 +1,22 @@
-"""Azure MCP Server Module for Azure Tools Integration"""
+"""Container-compatible GitHub MCP Server Module"""
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-import asyncio
 import logging
 import os
+import subprocess
+import sys
 from typing import List, Dict, Any, Optional, Tuple
 from contextlib import asynccontextmanager
 
 logger = logging.getLogger(__name__)
 
 
-class AzureMCPServer:
-    """Server for managing Azure MCP (Model Context Protocol) connections and tool calls"""
+class GitHubMCPServerContainer:
+    """Container-compatible GitHub MCP Server that uses direct GitHub MCP installation"""
     
     def __init__(self, command: str = "npx", args: List[str] = None, env: Dict[str, str] = None):
-        """Initialize Azure MCP server with parameters
+        """Initialize GitHub MCP server with npx (container-compatible)
         
         Args:
             command: Command to run the MCP server (default: "npx")
@@ -23,8 +24,16 @@ class AzureMCPServer:
             env: Environment variables to pass to the MCP server
         """
         self.command = command
-        self.args = args or ["-y", "@azure/mcp@latest", "server", "start"]
+        self.args = args or ["-y", "@modelcontextprotocol/server-github@latest"]
+        
+        # Set up environment with GitHub token
+        github_token = os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN")
+        if not github_token:
+            raise ValueError("GITHUB_PERSONAL_ACCESS_TOKEN environment variable is required")
+        
         self.env = env or {**os.environ}
+        self.env["GITHUB_PERSONAL_ACCESS_TOKEN"] = github_token
+        
         self._session: Optional[ClientSession] = None
         self._read = None
         self._write = None
@@ -50,6 +59,13 @@ class AzureMCPServer:
     async def initialize(self) -> None:
         """Initialize the MCP server and session"""
         try:
+            # Check if npx is available
+            try:
+                subprocess.run([self.command, "--version"], 
+                             check=True, capture_output=True, text=True)
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                raise RuntimeError(f"Command '{self.command}' not found. Ensure Node.js/npx is installed.")
+            
             # Create server parameters
             server_params = StdioServerParameters(
                 command=self.command,
@@ -66,13 +82,13 @@ class AzureMCPServer:
             await self._session.__aenter__()
             await self._session.initialize()
             
-            logger.info("Azure MCP Server initialized successfully")
+            logger.info("GitHub MCP Server (Container) initialized successfully")
             
             # Load available tools
             await self._load_tools()
             
         except Exception as e:
-            logger.error(f"Failed to initialize Azure MCP Server: {e}")
+            logger.error(f"Failed to initialize GitHub MCP Server (Container): {e}")
             raise
 
     async def _load_tools(self) -> None:
@@ -96,7 +112,7 @@ class AzureMCPServer:
             for tool in self._tools
         ]
         
-        logger.info(f"Loaded {len(self._tools)} Azure MCP tools")
+        logger.info(f"Loaded {len(self._tools)} GitHub MCP tools (Container)")
 
     def list_tools(self) -> List[Tuple[str, str]]:
         """List available tools with their descriptions
@@ -122,7 +138,7 @@ class AzureMCPServer:
             raise RuntimeError("Session not initialized")
             
         try:
-            logger.info(f"Calling Azure MCP tool: {tool_name}")
+            logger.info(f"Calling GitHub MCP tool (Container): {tool_name}")
             logger.debug(f"Tool arguments: {arguments}")
             
             result = await self._session.call_tool(tool_name, arguments)
@@ -143,57 +159,44 @@ class AzureMCPServer:
             else:
                 content = str(result)
             
-            logger.info(f"Tool {tool_name} completed successfully")
+            logger.info(f"Tool {tool_name} completed successfully (Container)")
             return content
             
         except Exception as e:
-            logger.error(f"Error calling tool {tool_name}: {e}")
+            logger.error(f"Error calling tool {tool_name} (Container): {e}")
             raise
 
     async def close(self) -> None:
         """Close the MCP session and clean up resources"""
-        cleanup_errors = []
-        
-        # Close session first
-        if self._session:
-            try:
-                await asyncio.wait_for(
-                    self._session.__aexit__(None, None, None),
-                    timeout=2.0
-                )
-            except (asyncio.TimeoutError, asyncio.CancelledError, RuntimeError) as e:
-                cleanup_errors.append(f"Session close {type(e).__name__}")
-            except Exception as e:
-                cleanup_errors.append(f"Session close: {e}")
-            finally:
-                self._session = None
-        
-        # Close stdio context with shorter timeout and better error handling
-        if self._stdio_context:
-            try:
-                await asyncio.wait_for(
-                    self._stdio_context.__aexit__(None, None, None),
-                    timeout=2.0
-                )
-            except (asyncio.TimeoutError, asyncio.CancelledError, RuntimeError) as e:
-                cleanup_errors.append(f"Stdio context {type(e).__name__}")
-                # Force cleanup by setting to None
-            except Exception as e:
-                cleanup_errors.append(f"Stdio context: {e}")
-            finally:
-                self._stdio_context = None
+        try:
+            if self._session:
+                try:
+                    await self._session.__aexit__(None, None, None)
+                except Exception as e:
+                    logger.warning(f"Error closing session: {e}")
+                finally:
+                    self._session = None
             
-        self._read = None
-        self._write = None
-        
-        if cleanup_errors:
-            logger.warning(f"Azure MCP Server close warnings: {'; '.join(cleanup_errors)}")
-        else:
-            logger.info("Azure MCP Server closed successfully")
+            if self._stdio_context:
+                try:
+                    await self._stdio_context.__aexit__(None, None, None)
+                except Exception as e:
+                    logger.warning(f"Error closing stdio context: {e}")
+                finally:
+                    self._stdio_context = None
+                
+            self._read = None
+            self._write = None
+                
+            logger.info("GitHub MCP Server (Container) closed")
+            
+        except Exception as e:
+            logger.error(f"Error closing GitHub MCP Server (Container): {e}")
+            # Don't re-raise during cleanup
 
     @asynccontextmanager
     async def create_session(self):
-        """Context manager for Azure MCP Server session"""
+        """Context manager for GitHub MCP Server session"""
         try:
             await self.initialize()
             yield self
@@ -203,3 +206,7 @@ class AzureMCPServer:
             except Exception as e:
                 logger.warning(f"Error during cleanup: {e}")
                 # Continue with cleanup, don't raise
+
+
+# Fallback to original Docker-based implementation if not in container
+GitHubMCPServer = GitHubMCPServerContainer

@@ -2,6 +2,7 @@
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+import asyncio
 import logging
 import os
 from typing import List, Dict, Any, Optional, Tuple
@@ -167,31 +168,44 @@ class GitHubMCPServer:
 
     async def close(self) -> None:
         """Close the MCP session and clean up resources"""
-        try:
-            if self._session:
-                try:
-                    await self._session.__aexit__(None, None, None)
-                except Exception as e:
-                    logger.warning(f"Error closing session: {e}")
-                finally:
-                    self._session = None
+        cleanup_errors = []
+        
+        # Close session first
+        if self._session:
+            try:
+                await asyncio.wait_for(
+                    self._session.__aexit__(None, None, None),
+                    timeout=2.0
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError, RuntimeError) as e:
+                cleanup_errors.append(f"Session close {type(e).__name__}")
+            except Exception as e:
+                cleanup_errors.append(f"Session close: {e}")
+            finally:
+                self._session = None
+        
+        # Close stdio context with shorter timeout and better error handling
+        if self._stdio_context:
+            try:
+                await asyncio.wait_for(
+                    self._stdio_context.__aexit__(None, None, None),
+                    timeout=2.0
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError, RuntimeError) as e:
+                cleanup_errors.append(f"Stdio context {type(e).__name__}")
+                # Force cleanup by setting to None
+            except Exception as e:
+                cleanup_errors.append(f"Stdio context: {e}")
+            finally:
+                self._stdio_context = None
             
-            if self._stdio_context:
-                try:
-                    await self._stdio_context.__aexit__(None, None, None)
-                except Exception as e:
-                    logger.warning(f"Error closing stdio context: {e}")
-                finally:
-                    self._stdio_context = None
-                
-            self._read = None
-            self._write = None
-                
-            logger.info("GitHub MCP Server closed")
-            
-        except Exception as e:
-            logger.error(f"Error closing GitHub MCP Server: {e}")
-            # Don't re-raise during cleanup
+        self._read = None
+        self._write = None
+        
+        if cleanup_errors:
+            logger.warning(f"GitHub MCP Server close warnings: {'; '.join(cleanup_errors)}")
+        else:
+            logger.info("GitHub MCP Server closed successfully")
 
     @asynccontextmanager
     async def create_session(self):

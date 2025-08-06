@@ -2,7 +2,7 @@ from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from openai import AzureOpenAI
 from azure_mcp_server import AzureMCPServer
 from github_mcp_server import GitHubMCPServer
-import json, os, logging, asyncio, sys, re, signal
+import json, os, logging, asyncio, sys, re
 from dotenv import load_dotenv
 from typing import List, Dict, Set, Optional
 
@@ -113,37 +113,14 @@ class DynamicToolManager:
         conversation_lower = conversation_text.lower()
         needed_categories = set()
         
-        # Debug: Print what we're analyzing
-        print(f"🔍 Analyzing: '{current_input}'")
-        
-        # Check for category keywords using word boundaries for more precise matching
-        import re
+        # Check for category keywords
         for category, config in TOOL_CATEGORIES.items():
-            matching_keywords = []
-            for keyword in config["keywords"]:
-                # Use word boundaries for better matching, except for single letters or very short terms
-                if len(keyword) <= 2:
-                    # For very short keywords, use exact word matching
-                    pattern = r'\b' + re.escape(keyword) + r'\b'
-                else:
-                    # For longer keywords, allow partial matches but be more restrictive
-                    pattern = r'\b' + re.escape(keyword)
-                
-                if re.search(pattern, conversation_lower):
-                    matching_keywords.append(keyword)
-            
-            if matching_keywords:
+            if any(keyword in conversation_lower for keyword in config["keywords"]):
                 needed_categories.add(category)
-                print(f"🎯 Detected {category} keywords: {matching_keywords}")
         
-        # Default to Azure tools if nothing specific detected (more specific default)
-        if not needed_categories:
-            if not messages:  # First conversation - load both
-                needed_categories = {"azure", "github"}
-                print("🚀 First conversation - loading both tool sets")
-            else:  # Subsequent conversations - default to Azure only
-                needed_categories = {"azure"}
-                print("🔧 No specific keywords detected - defaulting to Azure tools")
+        # Default to basic tools if nothing specific detected
+        if not needed_categories and not messages:
+            needed_categories = {"azure", "github"}  # Start with both basic tool sets
         
         return needed_categories
     
@@ -223,54 +200,11 @@ class DynamicToolManager:
         return f"{', '.join(summary)} - Total: {total_tools} tools"
     
     async def cleanup(self):
-        """Clean up all active sessions with robust error handling"""
-        cleanup_errors = []
-        
-        # Close Azure server
+        """Clean up all active sessions"""
         if self.azure_session_active and self.azure_server:
-            try:
-                # Try graceful close with timeout
-                await asyncio.wait_for(self.azure_server.close(), timeout=1.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError, RuntimeError) as e:
-                cleanup_errors.append(f"Azure {type(e).__name__}")
-                # Force cleanup by nullifying references
-                try:
-                    self.azure_server._session = None
-                    self.azure_server._stdio_context = None
-                    self.azure_server._read = None
-                    self.azure_server._write = None
-                except:
-                    pass  # Ignore any errors during force cleanup
-            except Exception as e:
-                cleanup_errors.append(f"Azure: {e}")
-        
-        # Close GitHub server
+            await self.azure_server.close()
         if self.github_session_active and self.github_server:
-            try:
-                # Try graceful close with timeout
-                await asyncio.wait_for(self.github_server.close(), timeout=1.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError, RuntimeError) as e:
-                cleanup_errors.append(f"GitHub {type(e).__name__}")
-                # Force cleanup by nullifying references
-                try:
-                    self.github_server._session = None
-                    self.github_server._stdio_context = None
-                    self.github_server._read = None
-                    self.github_server._write = None
-                except:
-                    pass  # Ignore any errors during force cleanup
-            except Exception as e:
-                cleanup_errors.append(f"GitHub: {e}")
-        
-        # Force reset state regardless of cleanup success
-        self.azure_session_active = False
-        self.github_session_active = False
-        self.active_categories.clear()
-        
-        if cleanup_errors:
-            print(f"⚠ Cleanup warnings: {', '.join(cleanup_errors)}")
-        else:
-            print("✓ Resources cleaned up successfully")
+            await self.github_server.close()
 
 
 async def run():
@@ -465,36 +399,15 @@ async def run_conversation_loop(client, tool_manager: DynamicToolManager):
                 print("Connection error detected. You may need to restart the script.")
                 break
     
-    # Cleanup with better error handling
-    print("\n🧹 Cleaning up resources...")
-    try:
-        # Use a short timeout for cleanup during shutdown
-        await asyncio.wait_for(tool_manager.cleanup(), timeout=3.0)
-    except asyncio.TimeoutError:
-        print("⚠ Cleanup timed out - forcing shutdown")
-    except Exception as e:
-        print(f"⚠ Cleanup warnings: {e}")
-    finally:
-        print("👋 Goodbye!")
+    # Cleanup
+    await tool_manager.cleanup()
 
 
 if __name__ == "__main__":
-    async def shutdown_handler(tool_manager=None):
-        """Handle graceful shutdown"""
-        if tool_manager:
-            print("\n🛑 Shutdown signal received - cleaning up...")
-            try:
-                await asyncio.wait_for(tool_manager.cleanup(), timeout=3.0)
-            except asyncio.TimeoutError:
-                print("⚠ Cleanup timed out during shutdown")
-            except Exception as e:
-                print(f"⚠ Cleanup error during shutdown: {e}")
-        print("👋 Goodbye!")
-    
     try:
         asyncio.run(run())
     except KeyboardInterrupt:
-        print("\n🛑 Interrupted by user")
+        print("\nExiting...")
         sys.exit(0)
     except Exception as e:
         logger.error(f"Application error: {e}")
