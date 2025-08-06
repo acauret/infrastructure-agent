@@ -1,11 +1,25 @@
+import asyncio
+import json
+import logging
+import os
+import re
+import sys
+from typing import List, Dict, Set, Optional
+
 from azure.ai.inference import ChatCompletionsClient
-from azure.ai.inference.models import SystemMessage, UserMessage, AssistantMessage, ToolMessage, ChatCompletionsToolCall, FunctionCall
+from azure.ai.inference.models import (
+    SystemMessage, 
+    UserMessage, 
+    AssistantMessage, 
+    ToolMessage, 
+    ChatCompletionsToolCall, 
+    FunctionCall
+)
 from azure.core.credentials import AzureKeyCredential
+from dotenv import load_dotenv
+
 from azure_mcp_server import AzureMCPServer
 from github_mcp_server import GitHubMCPServer
-import json, os, logging, asyncio, sys, re
-from dotenv import load_dotenv
-from typing import List, Dict, Set, Optional
 
 # Setup logging
 logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(message)s')
@@ -20,8 +34,8 @@ AZURE_API_KEY = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_KEY
 if not AZURE_OPENAI_ENDPOINT or not AZURE_API_KEY:
     raise ValueError("Missing required environment variables: AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY")
 
-# Convert endpoint format
 def get_inference_endpoint(base_endpoint: str, model: str) -> str:
+    """Convert endpoint format for Azure AI Inference"""
     if "openai.azure.com" in base_endpoint:
         resource_name = base_endpoint.split("//")[1].split(".")[0]
         return f"https://{resource_name}.cognitiveservices.azure.com/openai/deployments/{model}"
@@ -29,7 +43,7 @@ def get_inference_endpoint(base_endpoint: str, model: str) -> str:
 
 INFERENCE_ENDPOINT = get_inference_endpoint(AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_MODEL)
 
-# Tool categorization for dynamic loading (same as original main.py)
+# Tool categorization for dynamic loading
 TOOL_CATEGORIES = {
     "azure": {
         "keywords": [
@@ -82,8 +96,9 @@ TOOL_CATEGORIES = {
     }
 }
 
+
 class DynamicToolManager:
-    """Manages dynamic loading and unloading of MCP tool sets (same as original main.py)"""
+    """Manages dynamic loading and unloading of MCP tool sets"""
     
     def __init__(self):
         self.azure_server: Optional[AzureMCPServer] = None
@@ -91,17 +106,25 @@ class DynamicToolManager:
         self.active_categories: Set[str] = set()
         self.azure_session_active = False
         self.github_session_active = False
-        self.azure_tools = []
-        self.github_tools = []
+        self.azure_tools: List = []
+        self.github_tools: List = []
     
     async def analyze_conversation_context(self, messages: List[Dict], current_input: str = "") -> Set[str]:
         """Analyze conversation to determine needed tool categories"""
-        # Combine all conversation text
-        conversation_text = " ".join([
-            self._extract_message_content(msg) for msg in messages
-        ]) + " " + current_input
+        # Focus primarily on current input, with some context from recent messages
+        current_input_lower = current_input.lower()
         
-        conversation_lower = conversation_text.lower()
+        # Get context from last 2 user messages only (avoid assistant responses that might contain keywords)
+        recent_context = ""
+        if len(messages) > 1:
+            user_messages = [msg for msg in messages[-4:] if msg.get("role") == "user"]  # Last 4 messages, user only
+            if user_messages:
+                recent_context = " ".join([
+                    self._extract_message_content(msg) for msg in user_messages
+                ]).lower()
+        
+        # Combine current input with recent context, prioritizing current input
+        analysis_text = current_input_lower + " " + recent_context
         needed_categories = set()
         
         # Debug: Print what we're analyzing
@@ -110,20 +133,39 @@ class DynamicToolManager:
         # Check for category keywords using word boundaries for more precise matching
         for category, config in TOOL_CATEGORIES.items():
             matching_keywords = []
+            
+            # First check current input (higher priority)
+            current_matches = []
             for keyword in config["keywords"]:
-                # Use word boundaries for exact matching to avoid false positives
                 pattern = r'\b' + re.escape(keyword) + r'\b'
-                
-                if re.search(pattern, conversation_lower):
-                    matching_keywords.append(keyword)
+                if re.search(pattern, current_input_lower):
+                    current_matches.append(keyword)
+            
+            # Then check recent context (lower priority, avoid duplicates)
+            context_matches = []
+            for keyword in config["keywords"]:
+                if keyword not in current_matches:  # Avoid duplicates
+                    pattern = r'\b' + re.escape(keyword) + r'\b'
+                    if re.search(pattern, recent_context):
+                        context_matches.append(keyword)
+            
+            # Combine matches, prioritizing current input
+            matching_keywords = current_matches + context_matches
             
             if matching_keywords:
                 needed_categories.add(category)
-                print(f"🎯 Detected {category} keywords: {matching_keywords}")
+                if current_matches:
+                    print(f"🎯 Detected {category} keywords in current input: {current_matches}")
+                if context_matches:
+                    print(f"🎯 Detected {category} keywords in context: {context_matches}")
         
-        # Default to Azure tools if nothing specific detected
+        # If no specific keywords detected, use already loaded tools or default to Azure
         if not needed_categories:
-            if len(messages) <= 1:  # First conversation (system + user) - load Azure only initially
+            if self.active_categories:
+                # Keep using already loaded tools
+                needed_categories = self.active_categories.copy()
+                print(f"🔧 No new keywords detected - continuing with {', '.join(needed_categories)} tools")
+            elif len(messages) <= 1:  # First conversation (system + user) - load Azure only initially
                 needed_categories = {"azure"}
                 print("🚀 First conversation - loading Azure tools")
             else:  # Subsequent conversations - default to Azure only
@@ -225,13 +267,15 @@ class DynamicToolManager:
                 await asyncio.wait_for(self.azure_server.close(), timeout=1.0)
             except (asyncio.TimeoutError, asyncio.CancelledError, RuntimeError) as e:
                 cleanup_errors.append(f"Azure {type(e).__name__}")
-                try:
+                # Force cleanup attributes to prevent hanging connections
+                if hasattr(self.azure_server, '_session'):
                     self.azure_server._session = None
+                if hasattr(self.azure_server, '_stdio_context'):
                     self.azure_server._stdio_context = None
+                if hasattr(self.azure_server, '_read'):
                     self.azure_server._read = None
+                if hasattr(self.azure_server, '_write'):
                     self.azure_server._write = None
-                except:
-                    pass
             except Exception as e:
                 cleanup_errors.append(f"Azure: {e}")
         
@@ -241,13 +285,15 @@ class DynamicToolManager:
                 await asyncio.wait_for(self.github_server.close(), timeout=1.0)
             except (asyncio.TimeoutError, asyncio.CancelledError, RuntimeError) as e:
                 cleanup_errors.append(f"GitHub {type(e).__name__}")
-                try:
+                # Force cleanup attributes to prevent hanging connections
+                if hasattr(self.github_server, '_session'):
                     self.github_server._session = None
+                if hasattr(self.github_server, '_stdio_context'):
                     self.github_server._stdio_context = None
+                if hasattr(self.github_server, '_read'):
                     self.github_server._read = None
+                if hasattr(self.github_server, '_write'):
                     self.github_server._write = None
-                except:
-                    pass
             except Exception as e:
                 cleanup_errors.append(f"GitHub: {e}")
         
@@ -293,7 +339,6 @@ def convert_messages_to_azure_ai_format(messages: List[Dict]) -> List:
 async def run_conversation_loop(client: ChatCompletionsClient, tool_manager: DynamicToolManager):
     """Run the main conversation loop with dynamic tool loading (Azure AI Inference version)"""
     # Check if we're in an interactive environment
-    import sys
     if not sys.stdin.isatty():
         print("⚠ Warning: Not running in an interactive terminal. This may cause input issues.")
         print("💡 Try running the script directly in a terminal/command prompt.")
@@ -335,14 +380,19 @@ async def run_conversation_loop(client: ChatCompletionsClient, tool_manager: Dyn
             
             # Load any new tool categories that are needed
             newly_loaded = []
+            already_loaded = []
             for category in needed_categories:
                 if category not in tool_manager.active_categories:
                     await tool_manager.load_category_tools(category)
                     newly_loaded.append(category)
+                else:
+                    already_loaded.append(category)
             
             # Show what was loaded
             if newly_loaded:
                 print(f"🔧 Loaded {', '.join(newly_loaded)} tools for this conversation")
+            elif already_loaded:
+                print(f"📦 Using already loaded {', '.join(already_loaded)} tools")
             
             # Add user message
             messages.append({"role": "user", "content": user_input})
@@ -410,12 +460,21 @@ async def run_conversation_loop(client: ChatCompletionsClient, tool_manager: Dyn
                                 if hasattr(function, 'name') and function.name and not current_tool_call["function"]["name"]:
                                     current_tool_call["function"]["name"] = function.name
                                 
-                                # Accumulate arguments
+                                # Accumulate arguments (handle streaming JSON properly)
                                 if hasattr(function, 'arguments') and function.arguments:
                                     current_tool_call["function"]["arguments"] += function.arguments
+                                    
+                                    # Debug: Show accumulated arguments for troubleshooting
+                                    if logger.isEnabledFor(logging.DEBUG):
+                                        print(f"\n🔍 Accumulated args for {current_tool_call['function']['name']}: {current_tool_call['function']['arguments']}")
 
             # Clean up the response message for Azure AI format
-            if assistant_message.get("tool_calls") and any(tc["function"]["name"] for tc in assistant_message["tool_calls"]):
+            valid_tool_calls = assistant_message.get("tool_calls") and any(
+                tc.get("function", {}).get("name") and tc.get("function", {}).get("arguments") 
+                for tc in assistant_message["tool_calls"]
+            )
+            
+            if valid_tool_calls:
                 # Create proper Azure AI AssistantMessage with tool calls
                 azure_tool_calls = []
                 
@@ -438,17 +497,75 @@ async def run_conversation_loop(client: ChatCompletionsClient, tool_manager: Dyn
                 messages.append({"role": "assistant", "content": assistant_message["content"]})
 
             # Handle tool calls
-            if assistant_message.get("tool_calls") and any(tc["function"]["name"] for tc in assistant_message["tool_calls"]):
+            if valid_tool_calls:
                 for tool_call in assistant_message["tool_calls"]:
                     if not tool_call["function"]["name"]:  # Skip empty tool calls
                         continue
                         
                     try:
                         function_name = tool_call["function"]["name"]
-                        function_args = json.loads(tool_call["function"]["arguments"])
+                        function_args_raw = tool_call["function"]["arguments"]
                         
-                        # Use the tool manager to route the call
-                        content = await tool_manager.call_tool(function_name, function_args)
+                        # Debug: Print the raw arguments for troubleshooting
+                        print(f"🔧 Calling tool: {function_name}")
+                        print(f"📋 Raw arguments: {function_args_raw}")
+                        
+                        # Try to parse JSON with better error handling
+                        try:
+                            function_args = json.loads(function_args_raw)
+                        except json.JSONDecodeError as json_error:
+                            print(f"❌ JSON parsing error: {json_error}")
+                            print(f"📄 Raw arguments (length {len(function_args_raw)}): '{function_args_raw}'")
+                            
+                            # Try to extract the first valid JSON object from concatenated JSON
+                            try:
+                                # Find the end of the first JSON object
+                                brace_count = 0
+                                first_json_end = 0
+                                for i, char in enumerate(function_args_raw):
+                                    if char == '{':
+                                        brace_count += 1
+                                    elif char == '}':
+                                        brace_count -= 1
+                                        if brace_count == 0:
+                                            first_json_end = i + 1
+                                            break
+                                
+                                if first_json_end > 0:
+                                    first_json = function_args_raw[:first_json_end]
+                                    function_args = json.loads(first_json)
+                                    print(f"✅ Successfully parsed first JSON object: {first_json}")
+                                else:
+                                    raise ValueError("Could not find complete JSON object")
+                            except:
+                                # Try to clean the JSON by removing extra data
+                                cleaned_args = function_args_raw.strip()
+                                if cleaned_args.endswith(','):
+                                    cleaned_args = cleaned_args[:-1]
+                                try:
+                                    function_args = json.loads(cleaned_args)
+                                    print(f"✅ Successfully parsed cleaned JSON")
+                                except:
+                                    # If still fails, use empty dict
+                                    function_args = {}
+                                    print(f"⚠️ Using empty arguments due to JSON parsing failure")
+                        
+                        # Use the tool manager to route the call with timeout
+                        print(f"⏳ Executing tool: {function_name}")
+                        try:
+                            content = await asyncio.wait_for(
+                                tool_manager.call_tool(function_name, function_args), 
+                                timeout=30.0
+                            )
+                            print(f"✅ Tool completed: {function_name} (response length: {len(content)})")
+                            if not content.strip():
+                                content = f"Tool {function_name} executed successfully but returned no content."
+                        except asyncio.TimeoutError:
+                            content = f"Tool {function_name} timed out after 30 seconds."
+                            print(f"⏰ Tool timeout: {function_name}")
+                        except Exception as tool_error:
+                            content = f"Tool {function_name} failed: {str(tool_error)}"
+                            print(f"❌ Tool error: {function_name} - {tool_error}")
                         
                         # Add the tool response to messages in OpenAI format for our tracking
                         messages.append({
@@ -458,7 +575,9 @@ async def run_conversation_loop(client: ChatCompletionsClient, tool_manager: Dyn
                             "content": content,
                         })
                     except Exception as e:
-                        logger.error(f"Error calling tool {function_name}: {e}")
+                        error_msg = f"Error calling tool {function_name}: {e}"
+                        logger.error(error_msg)
+                        print(f"❌ {error_msg}")
                         messages.append({
                             "tool_call_id": tool_call["id"],
                             "role": "tool",
@@ -517,6 +636,7 @@ async def run_conversation_loop(client: ChatCompletionsClient, tool_manager: Dyn
 
 
 async def run():
+    """Main entry point for the application"""
     # Check for test mode
     if len(sys.argv) > 1 and sys.argv[1] == "--test":
         print("🧪 Running in test mode...")
