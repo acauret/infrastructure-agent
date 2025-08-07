@@ -94,26 +94,33 @@ def create_mcp_server_params():
     except Exception as e:
         print(f"❌ Azure MCP server params creation failed: {e}")
     
-    # GitHub MCP server parameters
+    # GitHub MCP server parameters (with environment variables)
     try:
         github_token = os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN")
         if github_token:
             print("🔄 Creating GitHub MCP server params...")
+            print(f"🔑 GitHub token found: {github_token[:8]}...")
+            
+            # Create environment with GitHub token
+            current_env = os.environ.copy()
+            current_env["GITHUB_PERSONAL_ACCESS_TOKEN"] = github_token
+            
+            # Try npx-based GitHub MCP server with proper environment
             github_server_params = StdioServerParams(
-                command="docker",
+                command="npx",
                 args=[
-                    "run", "-i", "--rm",
-                    "-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
-                    "ghcr.io/github/github-mcp-server",
+                    "github-mcp-custom",
                     "stdio"
-                ]
+                ],
+                env=current_env  # Pass environment variables including the GitHub token
             )
             server_params.append(github_server_params)
-            print("✅ GitHub MCP server params created")
+            print("✅ GitHub MCP server params created (npx-based with token)")
         else:
             print("❌ GITHUB_PERSONAL_ACCESS_TOKEN not set - skipping GitHub MCP")
     except Exception as e:
         print(f"❌ GitHub MCP server params creation failed: {e}")
+        print("🔄 Continuing without GitHub MCP server")
     
     return server_params
 
@@ -149,30 +156,35 @@ async def run_agent_system(workbenches):
                 
                 # Create fresh agents for each request with unique names
                 request_count += 1
+                # Determine available team members dynamically
+                team_description = "AzureAgent: Handles Azure infrastructure queries and commands"
+                if has_github:
+                    team_description += "\n                        GitHubAgent: Handles GitHub repository analysis"
+                
                 coordinator_agent = AssistantAgent(
                     name=f"MagenticOneOrchestrator_{request_count}",
-                    description="Coordinates tasks between Azure and GitHub agents.",
+                    description="Coordinates tasks between available agents.",
                     model_client=azure_model_client,
-                    system_message="""
-                    You are a MagenticOne coordinator agent for Azure infrastructure and GitHub analysis.
-                    Your team members are:
-                        AzureAgent: Handles Azure infrastructure queries and commands
-                        GitHubAgent: Handles GitHub repository analysis (if available)
+                    system_message=f"""
+                    You are a MagenticOne coordinator agent for Azure infrastructure and analysis.
+                    Your available team members are:
+                        {team_description}
 
                     IMPORTANT: Avoid asking for clarification - be proactive and decisive.
 
                     For ambiguous requests like "list subscriptions" or "list subs":
-                    - DEFAULT ACTION: List BOTH Azure and GitHub subscriptions if both agents available
-                    - If only Azure agent available, focus on Azure subscriptions
+                    - Focus on Azure subscriptions (always available)
+                    - If GitHub agent is available and user asks about repos, use GitHubAgent
                     - Assign tasks clearly: "AzureAgent: list Azure subscriptions"
 
                     When assigning tasks, use this format:
-                    1. @AzureAgent: <specific task>
-                    2. @GitHubAgent: <specific task> (if available)
+                    1. @AzureAgent: <specific Azure task>
+                    2. @GitHubAgent: <specific GitHub task> (only if GitHub agent is available)
 
                     For Azure queries (subscriptions, VNets, resources), assign to AzureAgent.
-                    For GitHub queries (repositories, issues, PRs), assign to GitHubAgent.
-                    For ambiguous requests, assign to available agents.
+                    {"For GitHub queries (repositories, issues, PRs), assign to GitHubAgent." if has_github else "GitHub queries: Explain that GitHub tools are not currently available."}
+                    
+                    IMPORTANT: Only assign tasks to agents that are actually available in your team.
 
                     Only say "TERMINATE" when all assigned tasks have been completed by other agents and you have provided a final summary.
                     """,
@@ -222,30 +234,36 @@ async def run_agent_system(workbenches):
                 # Create participants list
                 participants = [coordinator_agent, azure_agent, user_proxy]
                 
-                # Add GitHub agent if available
+                # Add GitHub agent if available (with MCP error handling)
                 if has_github:
-                    github_agent = AssistantAgent(
-                        name=f"GitHubAgent_{request_count}",
-                        description="An agent for GitHub repository analysis.",
-                        model_client=azure_model_client,
-                        workbench=workbenches[1],
-                        model_client_stream=True,
-                        max_tool_iterations=10,
-                        system_message="""
-                        You are a GitHub repository analysis expert.
+                    try:
+                        github_agent = AssistantAgent(
+                            name=f"GitHubAgent_{request_count}",
+                            description="An agent for GitHub repository analysis.",
+                            model_client=azure_model_client,
+                            workbench=workbenches[1],
+                            model_client_stream=True,
+                            max_tool_iterations=10,
+                            system_message="""
+                            You are a GitHub repository analysis expert.
 
-                        When asked about repositories:
-                        1. List repositories with details
-                        2. Analyze code structure
-                        3. Review issues and pull requests
-                        4. Provide insights on repository health
+                            When asked about repositories:
+                            1. List repositories with details
+                            2. Analyze code structure
+                            3. Review issues and pull requests
+                            4. Provide insights on repository health
 
-                        Always use actual data from GitHub tools.
-                        
-                        When the MagenticOneOrchestrator assigns you a task, acknowledge and execute it immediately.
-                        """,
-                    )
-                    participants.insert(2, github_agent)
+                            Always use actual data from GitHub tools when available.
+                            If GitHub MCP tools are not accessible, politely explain the limitation.
+                            
+                            When the MagenticOneOrchestrator assigns you a task, acknowledge and execute it immediately.
+                            """,
+                        )
+                        participants.insert(2, github_agent)
+                    except Exception as github_error:
+                        print(f"⚠️  GitHub agent creation failed: {github_error}")
+                        print("🔄 Continuing with Azure-only team")
+                        has_github = False
 
                 # Create fresh team with unique agents
                 team = MagenticOneGroupChat(
@@ -304,9 +322,26 @@ async def main():
             print("❌ No MCP servers configured - running without MCP tools")
             workbenches = None
         else:
-            # Create list of workbenches for multiple MCP servers
-            workbenches = [McpWorkbench(params) for params in server_params_list]
-            print(f"✅ Created {len(workbenches)} MCP workbenches")
+            # Create list of workbenches for multiple MCP servers with error handling
+            workbenches = []
+            for i, params in enumerate(server_params_list):
+                try:
+                    workbench = McpWorkbench(params)
+                    workbenches.append(workbench)
+                    server_type = "Azure" if i == 0 else "GitHub"
+                    print(f"✅ Created {server_type} MCP workbench")
+                except Exception as e:
+                    server_type = "Azure" if i == 0 else "GitHub"
+                    print(f"❌ Failed to create {server_type} MCP workbench: {e}")
+                    if i == 0:  # Azure failed - this is critical
+                        print("⚠️  Azure MCP workbench failed - continuing without MCP tools")
+                        workbenches = None
+                        break
+                    else:  # GitHub failed - continue with Azure only
+                        print("🔄 Continuing with Azure MCP only")
+            
+            if workbenches:
+                print(f"✅ Successfully created {len(workbenches)} MCP workbench(es)")
         
         # Use context manager for proper resource management
         if workbenches:
