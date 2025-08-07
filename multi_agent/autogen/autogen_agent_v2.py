@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 # AutoGen 0.7.2 imports
 from autogen_agentchat.agents import AssistantAgent, UserProxyAgent
 from autogen_agentchat.conditions import MaxMessageTermination, TextMentionTermination, TextMessageTermination
-from autogen_agentchat.teams import MagenticOneGroupChat, RoundRobinGroupChat
+from autogen_agentchat.teams import MagenticOneGroupChat
 from autogen_agentchat.ui import Console
 from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
 from autogen_ext.tools.mcp import McpWorkbench, StdioServerParams
@@ -120,51 +120,17 @@ def create_mcp_server_params():
 async def run_agent_system(workbenches):
     """Run the agent system with optional MCP workbenches"""
     
-    # Define the main Azure agent
-    azure_agent = AssistantAgent(
-        name="AzureAgent",
-        description="An agent for Azure infrastructure analysis and management.",
-        model_client=azure_model_client,
-        workbench=workbenches[0] if workbenches else None,  # Use first workbench (Azure)
-        model_client_stream=True,
-        max_tool_iterations=10,
-        system_message="""
-        You are an Azure infrastructure expert with access to live Azure MCP tools.
-
-        MANDATORY: You MUST use your available Azure MCP tools to get actual data from the user's Azure account. 
-        
-        NEVER provide generic instructions about Azure CLI, PowerShell, or Portal usage.
-        NEVER provide example or fictional data.
-        ALWAYS call the actual MCP tools available to you.
-
-        When asked about Azure subscriptions:
-        1. IMMEDIATELY call the "subscription" function/tool that is available to you
-        2. Use arguments like {"command": "list", "parameters": {}} or {"learn": true}
-        3. Wait for the real results from the tool call
-        4. Format the actual returned data as a clean table:
-           | Subscription Name | Subscription ID | State | Tenant ID |
-        5. Present only the real data returned by the tool
-
-        For any Azure request:
-        - First call the appropriate MCP tool (subscription, group, storage, etc.)
-        - Use the real data returned
-        - Format results clearly
-        - Never suggest manual methods or provide generic instructions
-
-        You have access to live Azure MCP tools. Use them immediately for every request.
-        """,
-    )
-
-    # Simple team with just the Azure agent for now
-    team = RoundRobinGroupChat(
-        [azure_agent],
-        termination_condition=TextMessageTermination(source="AzureAgent"),
-    )
-
-    print("✅ Agent team created successfully")
+    print("✅ MagenticOne agent team setup ready")
     print(f"🔍 MCP workbenches: {'✅ Available' if workbenches else '❌ Not available'}")
+    has_github = workbenches and len(workbenches) > 1
+    if has_github:
+        print("📱 GitHub agent: ✅ Enabled")
+    else:
+        print("📱 GitHub agent: ❌ Not available (check GITHUB_PERSONAL_ACCESS_TOKEN)")
     print("-" * 50)
-    
+
+    # Use MagenticOneGroupChat (as originally requested)
+    request_count = 0
     while True:
         try:
             # Get task from user input
@@ -181,7 +147,114 @@ async def run_agent_system(workbenches):
             try:
                 print("🚀 Starting streaming execution...")
                 
-                # Use Console for clean output - following the exact pattern from the example
+                # Create fresh agents for each request with unique names
+                request_count += 1
+                coordinator_agent = AssistantAgent(
+                    name=f"MagenticOneOrchestrator_{request_count}",
+                    description="Coordinates tasks between Azure and GitHub agents.",
+                    model_client=azure_model_client,
+                    system_message="""
+                    You are a MagenticOne coordinator agent for Azure infrastructure and GitHub analysis.
+                    Your team members are:
+                        AzureAgent: Handles Azure infrastructure queries and commands
+                        GitHubAgent: Handles GitHub repository analysis (if available)
+
+                    IMPORTANT: Avoid asking for clarification - be proactive and decisive.
+
+                    For ambiguous requests like "list subscriptions" or "list subs":
+                    - DEFAULT ACTION: List BOTH Azure and GitHub subscriptions if both agents available
+                    - If only Azure agent available, focus on Azure subscriptions
+                    - Assign tasks clearly: "AzureAgent: list Azure subscriptions"
+
+                    When assigning tasks, use this format:
+                    1. @AzureAgent: <specific task>
+                    2. @GitHubAgent: <specific task> (if available)
+
+                    For Azure queries (subscriptions, VNets, resources), assign to AzureAgent.
+                    For GitHub queries (repositories, issues, PRs), assign to GitHubAgent.
+                    For ambiguous requests, assign to available agents.
+
+                    Only say "TERMINATE" when all assigned tasks have been completed by other agents and you have provided a final summary.
+                    """,
+                )
+                
+                azure_agent = AssistantAgent(
+                    name=f"AzureAgent_{request_count}",
+                    description="An agent for Azure infrastructure analysis and management.",
+                    model_client=azure_model_client,
+                    workbench=workbenches[0] if workbenches else None,
+                    model_client_stream=True,
+                    max_tool_iterations=10,
+                    system_message="""
+                    You are an Azure infrastructure expert with access to live Azure MCP tools.
+
+                    MANDATORY: You MUST use your available Azure MCP tools to get actual data from the user's Azure account. 
+                    
+                    NEVER provide generic instructions about Azure CLI, PowerShell, or Portal usage.
+                    NEVER provide example or fictional data.
+                    ALWAYS call the actual MCP tools available to you.
+
+                    When asked about Azure subscriptions:
+                    1. IMMEDIATELY call the "subscription" function/tool that is available to you
+                    2. Use arguments like {"command": "list", "parameters": {}} or {"learn": true}
+                    3. Wait for the real results from the tool call
+                    4. Format the actual returned data as a clean table:
+                       | Subscription Name | Subscription ID | State | Tenant ID |
+                    5. Present only the real data returned by the tool
+
+                    For any Azure request:
+                    - First call the appropriate MCP tool (subscription, group, storage, etc.)
+                    - Use the real data returned
+                    - Format results clearly
+                    - Never suggest manual methods or provide generic instructions
+
+                    You have access to live Azure MCP tools. Use them immediately for every request.
+                    
+                    When the MagenticOneOrchestrator assigns you a task, acknowledge and execute it immediately.
+                    """,
+                )
+
+                user_proxy = UserProxyAgent(
+                    name=f"HumanUser_{request_count}",
+                    description="Human user who can provide clarification when needed."
+                )
+
+                # Create participants list
+                participants = [coordinator_agent, azure_agent, user_proxy]
+                
+                # Add GitHub agent if available
+                if has_github:
+                    github_agent = AssistantAgent(
+                        name=f"GitHubAgent_{request_count}",
+                        description="An agent for GitHub repository analysis.",
+                        model_client=azure_model_client,
+                        workbench=workbenches[1],
+                        model_client_stream=True,
+                        max_tool_iterations=10,
+                        system_message="""
+                        You are a GitHub repository analysis expert.
+
+                        When asked about repositories:
+                        1. List repositories with details
+                        2. Analyze code structure
+                        3. Review issues and pull requests
+                        4. Provide insights on repository health
+
+                        Always use actual data from GitHub tools.
+                        
+                        When the MagenticOneOrchestrator assigns you a task, acknowledge and execute it immediately.
+                        """,
+                    )
+                    participants.insert(2, github_agent)
+
+                # Create fresh team with unique agents
+                team = MagenticOneGroupChat(
+                    participants=participants,
+                    model_client=azure_model_client,
+                    termination_condition=MaxMessageTermination(10),
+                )
+                
+                # Use Console for clean output
                 await Console(team.run_stream(task=task))
                 
                 print("\n✅ Streaming completed")
@@ -197,7 +270,7 @@ async def run_agent_system(workbenches):
 
 async def main():
     """Main entry point"""
-    print("Starting Azure Infrastructure Agent Team...")
+    print("Starting MagenticOne Azure Infrastructure Agent Team...")
     print("-" * 50)
     
     # Check Azure authentication environment variables
