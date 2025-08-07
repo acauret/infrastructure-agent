@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "@playwright/test": "^1.54.2",
+    "install": "^0.13.0",
+    "npx": "^3.0.0",
+    "playwright": "^1.54.2"
+  }
+}

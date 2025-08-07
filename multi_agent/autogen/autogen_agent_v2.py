@@ -128,6 +128,7 @@ async def run_agent_system(workbenches: Optional[List[McpWorkbench]]):
     has_github = bool(workbenches and len(workbenches) > 1)
     # Playwright index depends on whether GitHub workbench is present
     has_playwright = bool(workbenches and ((has_github and len(workbenches) > 2) or (not has_github and len(workbenches) > 1)))
+    has_infracoder = bool(has_github)
     if has_github:
         print("📱 GitHub agent: ✅ Enabled")
     else:
@@ -136,6 +137,10 @@ async def run_agent_system(workbenches: Optional[List[McpWorkbench]]):
         print("🌐 Playwright agent: ✅ Enabled")
     else:
         print("🌐 Playwright agent: ❌ Not available")
+    if has_infracoder:
+        print("🧩 InfraCoder agent: ✅ Enabled")
+    else:
+        print("🧩 InfraCoder agent: ❌ Not available (requires GitHub MCP)")
     print("-" * 50)
 
     # Use MagenticOneGroupChat (as originally requested)
@@ -162,6 +167,8 @@ async def run_agent_system(workbenches: Optional[List[McpWorkbench]]):
                 team_description = "AzureAgent: Handles Azure infrastructure queries and commands"
                 if has_github:
                     team_description += "\n                        GitHubAgent: Handles GitHub repository analysis"
+                if has_infracoder:
+                    team_description += "\n                        InfraCoderAgent: Handles Terraform/Bicep coding tasks with branching and PRs"
                 
                 coordinator_agent = AssistantAgent(
                     name=f"MagenticOneOrchestrator_{request_count}",
@@ -182,6 +189,7 @@ async def run_agent_system(workbenches: Optional[List[McpWorkbench]]):
                     When assigning tasks, use this format:
                     1. @AzureAgent: <specific Azure task>
                     2. @GitHubAgent: <specific GitHub task> (only if GitHub agent is available)
+                    3. @InfraCoderAgent: <specific coding task for Terraform/Bicep and repo changes> (only if InfraCoder agent is available)
 
                     For Azure queries (subscriptions, VNets, resources), assign to AzureAgent.
                     {"For GitHub queries (repositories, issues, PRs), assign to GitHubAgent." if has_github else "GitHub queries: Explain that GitHub tools are not currently available."}
@@ -266,6 +274,49 @@ async def run_agent_system(workbenches: Optional[List[McpWorkbench]]):
                         print(f"⚠️  GitHub agent creation failed: {github_error}")
                         print("🔄 Continuing with Azure-only team")
                         has_github = False
+
+                # Add InfraCoder agent if available (uses GitHub + optional Playwright)
+                if has_infracoder:
+                    try:
+                        pw_index = 2 if has_github else 1
+                        coder_workbenches = [workbenches[1]]
+                        if has_playwright:
+                            coder_workbenches.append(workbenches[pw_index])
+                        infracoder_agent = AssistantAgent(
+                            name=f"InfraCoderAgent_{request_count}",
+                            description="An agent for Terraform/Bicep coding tasks: browse AVM modules, analyze repos, create branches and PRs.",
+                            model_client=azure_model_client,
+                            workbench=coder_workbenches,
+                            model_client_stream=True,
+                            max_tool_iterations=15,
+                            system_message="""
+                            You are an infrastructure-as-code engineer specializing in Terraform and Bicep.
+                            Your responsibilities:
+                            - Discover and reference latest Azure Verified Modules (AVM):
+                              Terraform: https://azure.github.io/Azure-Verified-Modules/indexes/terraform/tf-resource-modules/
+                              Bicep:    https://azure.github.io/Azure-Verified-Modules/indexes/bicep/bicep-resource-modules/
+                              Use the Playwright MCP tools to browse these pages when needed and extract authoritative guidance.
+                            - Analyze a target repository (structure, modules, conventions). Use GitHub MCP tools to search, read files, and inspect branches.
+                            - Implement changes following best practices (naming, tags, variables/parameters, README updates).
+                            - Workflow for repo changes (via GitHub MCP tools):
+                              1) Create a new branch named: feature/avm-<resource>-<yyyyMMdd>-<shortid>
+                              2) Add or modify files with minimal diffs and clear structure.
+                              3) Commit with conventional message, e.g.: feat(<area>): add <resource> with AVM best practices
+                              4) Open a Pull Request with a concise summary, checklist, and references to AVM docs.
+                            - Validate: plan or lint if tools are available; otherwise explain validation steps for the maintainer.
+                            - If required inputs are missing (repository, paths, resource details), propose a minimal plan and ask only for the essential missing fields.
+
+                            Important rules:
+                            - Prefer AVM modules where suitable; otherwise follow Microsoft Azure Terraform/Bicep guidance.
+                            - Do not include secrets. Use variables/parameters and document them.
+                            - Keep edits focused; avoid unrelated refactors unless explicitly requested.
+                            - Use available MCP tools only; do not invent tool names.
+                            """,
+                        )
+                        participants.insert(2, infracoder_agent)
+                    except Exception as coder_error:
+                        print(f"⚠️  InfraCoder agent creation failed: {coder_error}")
+                        has_infracoder = False
 
                 # Add Playwright web agent if available
                 if has_playwright:
