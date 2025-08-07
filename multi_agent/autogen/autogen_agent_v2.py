@@ -105,6 +105,18 @@ def create_mcp_server_params():
     except Exception as e:
         print(f"❌ GitHub MCP server params creation failed: {e}")
         print("🔄 Continuing without GitHub MCP server")
+
+    # Playwright MCP server (web browsing)
+    try:
+        print("🔄 Creating Playwright MCP server params...")
+        pw_params = StdioServerParams(
+            command="npx",
+            args=["@playwright/mcp@latest", "--headless"],
+        )
+        server_params.append(pw_params)
+        print("✅ Playwright MCP server params created")
+    except Exception as e:
+        print(f"❌ Playwright MCP server params creation failed: {e}")
     
     return server_params
 
@@ -113,11 +125,17 @@ async def run_agent_system(workbenches: Optional[List[McpWorkbench]]):
     
     print("✅ MagenticOne agent team setup ready")
     print(f"🔍 MCP workbenches: {'✅ Available' if workbenches else '❌ Not available'}")
-    has_github = workbenches and len(workbenches) > 1
+    has_github = bool(workbenches and len(workbenches) > 1)
+    # Playwright index depends on whether GitHub workbench is present
+    has_playwright = bool(workbenches and ((has_github and len(workbenches) > 2) or (not has_github and len(workbenches) > 1)))
     if has_github:
         print("📱 GitHub agent: ✅ Enabled")
     else:
         print("📱 GitHub agent: ❌ Not available (check GITHUB_PERSONAL_ACCESS_TOKEN)")
+    if has_playwright:
+        print("🌐 Playwright agent: ✅ Enabled")
+    else:
+        print("🌐 Playwright agent: ❌ Not available")
     print("-" * 50)
 
     # Use MagenticOneGroupChat (as originally requested)
@@ -249,6 +267,28 @@ async def run_agent_system(workbenches: Optional[List[McpWorkbench]]):
                         print("🔄 Continuing with Azure-only team")
                         has_github = False
 
+                # Add Playwright web agent if available
+                if has_playwright:
+                    try:
+                        pw_index = 2 if has_github else 1
+                        web_agent = AssistantAgent(
+                            name=f"WebAgent_{request_count}",
+                            description="An agent for web browsing and scraping using Playwright MCP.",
+                            model_client=azure_model_client,
+                            workbench=workbenches[pw_index],
+                            model_client_stream=True,
+                            max_tool_iterations=10,
+                            system_message="""
+                            You are a web browsing assistant using Playwright MCP tools.
+                            Use tools to navigate, click, type, extract content, and answer questions from the live web.
+                            Only browse when needed and cite the page URLs in your responses.
+                            """,
+                        )
+                        participants.insert(2, web_agent)
+                    except Exception as web_error:
+                        print(f"⚠️  Playwright agent creation failed: {web_error}")
+                        has_playwright = False
+
                 # Create fresh team with unique agents
                 team = MagenticOneGroupChat(
                     participants=participants,
@@ -312,10 +352,30 @@ async def main():
                 try:
                     workbench = McpWorkbench(params)
                     workbenches.append(workbench)
-                    server_type = "Azure" if i == 0 else "GitHub"
+                    args_str = " ".join(str(a) for a in getattr(params, "args", [])).lower()
+                    if "@azure/mcp" in args_str:
+                        server_type = "Azure"
+                    elif "@azure-devops/mcp" in args_str or "azure-devops" in args_str:
+                        server_type = "Azure DevOps"
+                    elif "github-mcp" in args_str or "server-github" in args_str:
+                        server_type = "GitHub"
+                    elif "@playwright/mcp" in args_str:
+                        server_type = "Playwright"
+                    else:
+                        server_type = "MCP"
                     print(f"✅ Created {server_type} MCP workbench")
                 except Exception as e:
-                    server_type = "Azure" if i == 0 else "GitHub"
+                    args_str = " ".join(str(a) for a in getattr(params, "args", [])).lower()
+                    if "@azure/mcp" in args_str:
+                        server_type = "Azure"
+                    elif "@azure-devops/mcp" in args_str or "azure-devops" in args_str:
+                        server_type = "Azure DevOps"
+                    elif "github-mcp" in args_str or "server-github" in args_str:
+                        server_type = "GitHub"
+                    elif "@playwright/mcp" in args_str:
+                        server_type = "Playwright"
+                    else:
+                        server_type = "MCP"
                     print(f"❌ Failed to create {server_type} MCP workbench: {e}")
                     if i == 0:  # Azure failed - this is critical
                         print("⚠️  Azure MCP workbench failed - continuing without MCP tools")
