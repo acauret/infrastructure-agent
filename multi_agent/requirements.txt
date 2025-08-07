@@ -1,0 +1,13 @@
+# AutoGen 0.4 packages
+autogen-agentchat>=0.4.0
+autogen-core>=0.4.0
+autogen-ext[openai]>=0.4.0
+
+# Azure dependencies
+azure-identity>=1.15.0
+
+# Other dependencies
+python-dotenv>=1.0.0
+
+# MCP dependencies (if using MCP servers)
+mcp>=1.0.0

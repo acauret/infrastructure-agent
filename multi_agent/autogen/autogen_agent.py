@@ -1,4 +1,13 @@
-"""Azure Infrastructure Agent using AutoGen AgentChat with MCP Integration"""
+"""Azure Infrastructure Agent using AutoGen AgentChat with MCP Integration
+
+Prerequisites:
+1. Install dependencies: pip install -r requirements.txt
+2. Set environment variables:
+   - AZURE_OPENAI_ENDPOINT: Your Azure OpenAI endpoint
+   - AZURE_OPENAI_API_KEY or AZURE_OPENAI_KEY: Your Azure OpenAI API key
+   - AZURE_API_VERSION: API version (default: 2024-12-01-preview)
+3. Update azure_deployment names in the model client configurations below
+"""
 
 import asyncio
 import os
@@ -9,12 +18,11 @@ from dotenv import load_dotenv
 # AutoGen imports
 from autogen_agentchat.agents import AssistantAgent, UserProxyAgent
 from autogen_agentchat.conditions import MaxMessageTermination, TextMentionTermination
-from autogen_agentchat.messages import BaseAgentEvent, BaseChatMessage
-from autogen_agentchat.teams import MagenticOneGroupChat, SelectorGroupChat
+from autogen_agentchat.messages import TextMessage
+from autogen_agentchat.teams import MagenticOneGroupChat
 from autogen_agentchat.ui import Console
-from autogen_core.models import UserMessage, SystemMessage, AssistantMessage
-from autogen_ext.models.azure import AzureAIChatCompletionClient
-from azure.core.credentials import AzureKeyCredential
+from autogen_core.models import UserMessage
+from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
 
 # Load environment variables
 load_dotenv()
@@ -33,43 +41,28 @@ max_messages_termination = MaxMessageTermination(max_messages=50)
 termination = text_mention_termination | max_messages_termination
 
 # Create model clients for each agent
-azure_model_client = AzureAIChatCompletionClient(
-    endpoint=AZURE_OPENAI_ENDPOINT,
-    credential=AzureKeyCredential(AZURE_API_KEY),
+azure_model_client = AzureOpenAIChatCompletionClient(
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    api_key=AZURE_API_KEY,
     api_version=AZURE_API_VERSION,
-    model_info={
-        "json_output": True,
-        "function_calling": True,
-        "vision": False,
-        "family": "gpt-4o",
-        "structured_output": False,
-    },
+    azure_deployment="gpt-4o",  # Replace with your actual deployment name
+    model="gpt-4o",
 )
 
-github_model_client = AzureAIChatCompletionClient(
-    endpoint=AZURE_OPENAI_ENDPOINT,
-    credential=AzureKeyCredential(AZURE_API_KEY),
+github_model_client = AzureOpenAIChatCompletionClient(
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    api_key=AZURE_API_KEY,
     api_version=AZURE_API_VERSION,
-    model_info={
-        "json_output": True,
-        "function_calling": True,
-        "vision": False,
-        "family": "gpt-4o",
-        "structured_output": False,
-    },
+    azure_deployment="gpt-4o",  # Replace with your actual deployment name
+    model="gpt-4o",
 )
 
-coordinator_model_client = AzureAIChatCompletionClient(
-    endpoint=AZURE_OPENAI_ENDPOINT,
-    credential=AzureKeyCredential(AZURE_API_KEY),
+coordinator_model_client = AzureOpenAIChatCompletionClient(
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    api_key=AZURE_API_KEY,
     api_version=AZURE_API_VERSION,
-    model_info={
-        "json_output": True,
-        "function_calling": True,
-        "vision": False,
-        "family": "gpt-4o",
-        "structured_output": False,
-    },
+    azure_deployment="gpt-4o",  # Replace with your actual deployment name
+    model="gpt-4o",
 )
 
 # Define the agents
@@ -137,7 +130,6 @@ team = MagenticOneGroupChat(
     participants=[coordinator_agent, azure_agent, github_agent],
     model_client=coordinator_model_client,
     termination_condition=termination,
-    emit_team_events=True,
 )
 
 async def create_mcp_tools():
@@ -155,7 +147,7 @@ async def create_mcp_tools():
         azure_tools = []
         github_tools = []
         
-        # Initialize Azure MCP server
+        # Initialize Azure MCP server with better error handling
         try:
             azure_server = AzureMCPServer()
             await azure_server.initialize()
@@ -164,8 +156,9 @@ async def create_mcp_tools():
             print(f"✅ Azure MCP: {len(azure_tools)} tools loaded")
         except Exception as e:
             print(f"❌ Azure MCP initialization failed: {e}")
+            print("Continuing without Azure MCP tools...")
         
-        # Initialize GitHub MCP server
+        # Initialize GitHub MCP server with better error handling
         try:
             github_server = GitHubMCPServer()
             await github_server.initialize()
@@ -174,6 +167,7 @@ async def create_mcp_tools():
             print(f"✅ GitHub MCP: {len(github_tools)} tools loaded")
         except Exception as e:
             print(f"❌ GitHub MCP initialization failed: {e}")
+            print("Continuing without GitHub MCP tools...")
         
         return azure_tools, github_tools
         
@@ -187,53 +181,77 @@ async def main():
     print("Starting Azure Infrastructure Agent Team...")
     print("-" * 50)
     
-    # Get MCP tools
-    azure_tools, github_tools = await create_mcp_tools()
-    
-    # Set tools for agents
-    azure_agent.tools = azure_tools
-    github_agent.tools = github_tools
-    
-    print(f"Total tools available: Azure={len(azure_tools)}, GitHub={len(github_tools)}")
-    print("-" * 50)
-    
-    # Get task from user input
-    task = input("Enter your request (or 'quit' to exit): ")
-    
-    if task.lower() in ['quit', 'exit', 'bye']:
-        print("Goodbye!")
-        return
-    
-    print(f"\nProcessing: {task}")
-    print("-" * 50)
-    
     try:
-        async for message in team.run_stream(task=task):
-            # Skip TaskResult messages or handle them differently
-            if hasattr(message, 'messages') and not hasattr(message, 'source'):
-                # This is likely a TaskResult - you can access the final result here
-                print(f"[TASK COMPLETED] Final result with {len(message.messages)} messages")
-                continue
+        # Get MCP tools with timeout
+        azure_tools, github_tools = await asyncio.wait_for(
+            create_mcp_tools(), timeout=30.0
+        )
+        
+        # Set tools for agents
+        azure_agent.tools = azure_tools
+        github_agent.tools = github_tools
+        
+        print(f"Total tools available: Azure={len(azure_tools)}, GitHub={len(github_tools)}")
+        print("-" * 50)
+        
+        while True:
+            try:
+                # Get task from user input
+                task = input("Enter your request (or 'quit' to exit): ")
                 
-            print(
-                f"[{getattr(message, 'source', 'Unknown')}] ({getattr(message, 'type', type(message).__name__)}):\n{getattr(message, 'content', message)}\n"
-            )
-    
+                if task.lower() in ['quit', 'exit', 'bye']:
+                    print("Goodbye!")
+                    break
+                
+                print(f"\nProcessing: {task}")
+                print("-" * 50)
+                
+                # Run the team with timeout
+                result = await asyncio.wait_for(
+                    team.run(task=task), timeout=300.0  # 5 minute timeout
+                )
+                
+                print(f"\n=== Task Result ===")
+                if hasattr(result, 'messages') and result.messages:
+                    for i, message in enumerate(result.messages):
+                        source = getattr(message, 'source', 'Unknown')
+                        content = getattr(message, 'content', str(message))
+                        print(f"[{i+1}] {source}: {content}")
+                else:
+                    print("No messages returned")
+                print("==================\n")
+                
+            except asyncio.TimeoutError:
+                print("⏰ Task timed out after 5 minutes")
+            except KeyboardInterrupt:
+                print("\n\n⏹️  Interrupted by user")
+                break
+            except Exception as e:
+                print(f"❌ Error processing task: {e}")
+                # Continue with the loop instead of breaking
+                
+    except asyncio.TimeoutError:
+        print("❌ MCP initialization timed out after 30 seconds")
     except KeyboardInterrupt:
-        print("\n\nShutting down...")
+        print("\n\n⏹️  Shutting down...")
     except Exception as e:
-        print(f"\nError: {e}")
+        print(f"❌ Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
     
     finally:
-        # Clean up model clients, suppressing async shutdown errors
-        for client in [azure_model_client, github_model_client, coordinator_model_client]:
+        # Clean up model clients with better error handling
+        print("🧹 Cleaning up...")
+        for client_name, client in [("azure", azure_model_client), ("github", github_model_client), ("coordinator", coordinator_model_client)]:
             try:
-                await client.close()
-            except (asyncio.CancelledError, RuntimeError):
+                if hasattr(client, 'close'):
+                    await client.close()
+            except (asyncio.CancelledError, RuntimeError, ConnectionError):
+                # Suppress expected shutdown errors
                 pass
             except Exception as e:
-                print(f"Warning during shutdown: {e}")
-        print("Shutdown complete")
+                print(f"⚠️  Warning during {client_name} client shutdown: {e}")
+        print("✅ Shutdown complete")
 
 if __name__ == "__main__":
     try:
