@@ -11,14 +11,14 @@ Prerequisites:
 """
 
 import asyncio
+from contextlib import AsyncExitStack
 import os
-import sys
 from typing import List, Optional
 from dotenv import load_dotenv
 
 # AutoGen 0.7.2 imports
 from autogen_agentchat.agents import AssistantAgent, UserProxyAgent
-from autogen_agentchat.conditions import MaxMessageTermination, TextMentionTermination, TextMessageTermination
+from autogen_agentchat.conditions import MaxMessageTermination, TextMentionTermination
 from autogen_agentchat.teams import MagenticOneGroupChat
 from autogen_agentchat.ui import Console
 from autogen_ext.models.openai import AzureOpenAIChatCompletionClient
@@ -49,24 +49,8 @@ text_mention_termination = TextMentionTermination("TERMINATE")
 max_messages_termination = MaxMessageTermination(max_messages=30)
 termination = text_mention_termination | max_messages_termination
 
-# Create model clients for each agent
+# Create model client (shared across agents)
 azure_model_client = AzureOpenAIChatCompletionClient(
-    azure_endpoint=AZURE_OPENAI_ENDPOINT,
-    api_key=AZURE_API_KEY,
-    api_version=AZURE_API_VERSION,
-    azure_deployment=AZURE_DEPLOYMENT_NAME,
-    model=AZURE_MODEL_NAME,
-)
-
-github_model_client = AzureOpenAIChatCompletionClient(
-    azure_endpoint=AZURE_OPENAI_ENDPOINT,
-    api_key=AZURE_API_KEY,
-    api_version=AZURE_API_VERSION,
-    azure_deployment=AZURE_DEPLOYMENT_NAME,
-    model=AZURE_MODEL_NAME,
-)
-
-coordinator_model_client = AzureOpenAIChatCompletionClient(
     azure_endpoint=AZURE_OPENAI_ENDPOINT,
     api_key=AZURE_API_KEY,
     api_version=AZURE_API_VERSION,
@@ -124,7 +108,7 @@ def create_mcp_server_params():
     
     return server_params
 
-async def run_agent_system(workbenches):
+async def run_agent_system(workbenches: Optional[List[McpWorkbench]]):
     """Run the agent system with optional MCP workbenches"""
     
     print("✅ MagenticOne agent team setup ready")
@@ -269,7 +253,7 @@ async def run_agent_system(workbenches):
                 team = MagenticOneGroupChat(
                     participants=participants,
                     model_client=azure_model_client,
-                    termination_condition=MaxMessageTermination(10),
+                    termination_condition=termination,
                 )
                 
                 # Use Console for clean output
