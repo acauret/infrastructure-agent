@@ -54,19 +54,17 @@ def load_system_prompt():
     # Fallback verbose prompt if file doesn't exist
     return """You are an Azure infrastructure expert assistant with comprehensive GitHub and Azure tools.
 
-## COMMUNICATION STYLE - BE EXTREMELY VERBOSE
-Always provide detailed, step-by-step feedback for EVERY action:
+## AUTONOMOUS EXECUTION - COMPLETE ALL TASKS
+**CRITICAL**: When a user asks for infrastructure analysis, automatically perform ALL related discovery steps:
+- If asked about subscriptions → automatically get subscription details AND resource groups AND resources
+- If asked about networks → automatically get VNets AND subnets AND NSGs AND routing
+- If asked about resources → automatically enumerate ALL resource types across ALL resource groups
+- Continue until you have provided a COMPLETE analysis
 
-🔍 **ANALYZING**: [Always explain what you're examining and why]
-🎯 **OBJECTIVE**: [State the specific goal clearly]  
-📋 **PLAN**: [Break down the steps you'll take]
-🔧 **ACTION**: [Describe exactly what tool you're about to use]
-⏳ **EXECUTING**: [Show what command/tool is running]
-📊 **RESULT**: [Summarize what was found/accomplished]
-💡 **INSIGHT**: [Explain what this means for the task]
-🔄 **NEXT STEP**: [Explain what you'll do next]
+## COMMUNICATION STYLE
+Communicate naturally like an Azure expert. Explain what you're discovering and continue seamlessly to provide comprehensive analysis without asking permission.
 
-Always be educational, thorough, and explain your reasoning step-by-step."""
+Always complete the full scope of infrastructure discovery automatically."""
 
 # Tool categorization for dynamic loading
 TOOL_CATEGORIES = {
@@ -285,59 +283,6 @@ def convert_to_inference_messages(messages: List[Dict]) -> List:
     
     return inference_messages
 
-def should_continue_autonomously(message_content: str) -> bool:
-    """Detect if the agent wants to continue with more steps"""
-    continuation_indicators = [
-        "CONTINUING:",
-        "Now, I will automatically",
-        "Next, I will",
-        "Now I'll",
-        "Proceeding to",
-        "Moving on to",
-        "Next step:",
-        "I will now",
-        "Let me now",
-        "Now checking",
-        "Now listing",
-        "Now enumerating",
-        "automatically enumerate",
-        "automatically check",
-        "automatically review",
-        "automatically analyze"
-    ]
-    
-    message_lower = message_content.lower()
-    for indicator in continuation_indicators:
-        if indicator.lower() in message_lower:
-            return True
-    return False
-
-def extract_continuation_action(message_content: str) -> str:
-    """Extract what action the agent wants to continue with"""
-    message_lower = message_content.lower()
-    
-    # Common continuation patterns
-    if "enumerate" in message_lower and "resource group" in message_lower:
-        return "list all resource groups"
-    elif "enumerate" in message_lower and "resource" in message_lower:
-        return "enumerate resources in each resource group"
-    elif "check" in message_lower and "resource" in message_lower:
-        return "check resources in all resource groups"
-    elif "network" in message_lower and ("subnet" in message_lower or "vnet" in message_lower):
-        return "analyze network infrastructure including VNets and subnets"
-    elif "aks" in message_lower or "kubernetes" in message_lower:
-        return "review AKS clusters and their configuration"
-    elif "storage" in message_lower:
-        return "analyze storage accounts and configurations"
-    elif "security" in message_lower or "keyvault" in message_lower:
-        return "review security configurations including Key Vault"
-    
-    # Generic continuation
-    if "continuing" in message_lower:
-        return "continue with the next step"
-    
-    return None
-
 async def main():
     """Main conversation loop with autonomous execution"""
     print("Azure Infrastructure Agent")
@@ -361,17 +306,15 @@ async def main():
     
     try:
         while True:
-            # Check if we have a continuation action or need user input
-            if 'user_input' not in locals():
-                # Get user input
-                user_input = input("\nYou: ").strip()
-                
-                if user_input.lower() in ['exit', 'quit', 'bye']:
-                    print("Goodbye!")
-                    break
-                
-                if not user_input:
-                    continue
+            # Get user input
+            user_input = input("\nYou: ").strip()
+            
+            if user_input.lower() in ['exit', 'quit', 'bye']:
+                print("Goodbye!")
+                break
+            
+            if not user_input:
+                continue
             
             # Detect and ensure needed tool categories (silent)
             needed_categories = tool_manager.detect_needed_categories(user_input)
@@ -383,7 +326,7 @@ async def main():
             # Get available tools
             tools = tool_manager.get_available_tools()
             
-            # Make API call
+            # Make API call with streaming
             inference_messages = convert_to_inference_messages(messages)
             
             response = client.complete(
@@ -391,32 +334,76 @@ async def main():
                 tools=tools,
                 tool_choice="auto",
                 temperature=0.7,
-                max_tokens=2000
+                max_tokens=2000,
+                stream=True
             )
             
-            assistant_message = response.choices[0].message
+            # Handle streaming response
+            assistant_content = ""
+            tool_calls = []
             
-            # Handle tool calls
-            if assistant_message.tool_calls:
-                # Add assistant message with tool calls
-                messages.append({
-                    "role": "assistant", 
-                    "content": assistant_message.content,
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments
-                            }
-                        } for tc in assistant_message.tool_calls
-                    ]
-                })
+            print(f"\nAssistant: ", end="", flush=True)
+            
+            for chunk in response:
+                if chunk.choices and len(chunk.choices) > 0:
+                    choice = chunk.choices[0]
+                    
+                    # Handle content streaming
+                    if choice.delta.content:
+                        content_piece = choice.delta.content
+                        assistant_content += content_piece
+                        print(content_piece, end="", flush=True)
+                    
+                    # Handle tool calls
+                    if choice.delta.tool_calls:
+                        for tool_call_delta in choice.delta.tool_calls:
+                            # Extend tool_calls list if needed
+                            while len(tool_calls) <= tool_call_delta.index:
+                                tool_calls.append({
+                                    "id": "",
+                                    "function": {"name": "", "arguments": ""}
+                                })
+                            
+                            # Update the tool call at the specific index
+                            if tool_call_delta.id:
+                                tool_calls[tool_call_delta.index]["id"] = tool_call_delta.id
+                            if tool_call_delta.function:
+                                if tool_call_delta.function.name:
+                                    tool_calls[tool_call_delta.index]["function"]["name"] = tool_call_delta.function.name
+                                if tool_call_delta.function.arguments:
+                                    tool_calls[tool_call_delta.index]["function"]["arguments"] += tool_call_delta.function.arguments
+            
+            print()  # New line after streaming content
+            
+            # Create assistant message
+            assistant_message_data = {
+                "role": "assistant", 
+                "content": assistant_content
+            }
+            
+            # Handle tool calls if present
+            if tool_calls and any(tc["id"] for tc in tool_calls):
+                # Format tool calls for message history
+                formatted_tool_calls = [
+                    {
+                        "id": tc["id"],
+                        "function": {
+                            "name": tc["function"]["name"],
+                            "arguments": tc["function"]["arguments"]
+                        }
+                    } for tc in tool_calls if tc["id"]
+                ]
+                
+                assistant_message_data["tool_calls"] = formatted_tool_calls
+                messages.append(assistant_message_data)
                 
                 # Execute each tool call
-                for tool_call in assistant_message.tool_calls:
-                    function_name = tool_call.function.name
-                    function_args = json.loads(tool_call.function.arguments)
+                for tool_call in tool_calls:
+                    if not tool_call["id"]:  # Skip incomplete tool calls
+                        continue
+                        
+                    function_name = tool_call["function"]["name"]
+                    function_args = json.loads(tool_call["function"]["arguments"])
                     
                     try:
                         # Use concise tool calling
@@ -426,7 +413,7 @@ async def main():
                         messages.append({
                             "role": "tool",
                             "content": content,
-                            "tool_call_id": tool_call.id
+                            "tool_call_id": tool_call["id"]
                         })
                         
                     except Exception as e:
@@ -435,44 +422,36 @@ async def main():
                         messages.append({
                             "role": "tool",
                             "content": error_content,
-                            "tool_call_id": tool_call.id
+                            "tool_call_id": tool_call["id"]
                         })
                 
-                # Get final response after tool execution
+                # Get final response after tool execution with streaming
                 inference_messages = convert_to_inference_messages(messages)
                 
                 final_response = client.complete(
                     messages=inference_messages,
                     temperature=0.7,
-                    max_tokens=2000
+                    max_tokens=2000,
+                    stream=True
                 )
                 
-                final_message = final_response.choices[0].message.content
-                messages.append({"role": "assistant", "content": final_message})
+                final_content = ""
+                print(f"\nAssistant: ", end="", flush=True)
                 
-                print(f"\nAssistant: {final_message}")
+                for chunk in final_response:
+                    if chunk.choices and len(chunk.choices) > 0:
+                        choice = chunk.choices[0]
+                        if choice.delta.content:
+                            content_piece = choice.delta.content
+                            final_content += content_piece
+                            print(content_piece, end="", flush=True)
                 
-                # Check for autonomous continuation
-                if should_continue_autonomously(final_message):
-                    continue_action = extract_continuation_action(final_message)
-                    if continue_action:
-                        user_input = continue_action  # Set for next iteration
-                        continue  # Loop back to process continuation
+                print()  # New line after streaming
+                messages.append({"role": "assistant", "content": final_content})
                 
             else:
                 # No tool calls, just regular response
-                messages.append({"role": "assistant", "content": assistant_message.content})
-                print(f"\nAssistant: {assistant_message.content}")
-                
-                # Check for autonomous continuation
-                if should_continue_autonomously(assistant_message.content):
-                    continue_action = extract_continuation_action(assistant_message.content)
-                    if continue_action:
-                        user_input = continue_action  # Set for next iteration
-                        continue  # Loop back to process continuation
-            
-            # Clear user_input for next iteration (if no continuation)
-            del user_input
+                messages.append(assistant_message_data)
     
     except KeyboardInterrupt:
         print("\n\n🛑 **INTERRUPTED**: Shutting down gracefully...")
