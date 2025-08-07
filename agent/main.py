@@ -1,193 +1,152 @@
-from azure.identity import DefaultAzureCredential, get_bearer_token_provider
-from openai import AzureOpenAI
-from azure_mcp_server import AzureMCPServer
-from github_mcp_server import GitHubMCPServer
-import json, os, logging, asyncio, sys, re, signal
-from dotenv import load_dotenv
+import asyncio
+import json
+import logging
+import os
+import re
+import sys
 from typing import List, Dict, Set, Optional
 
-# Setup logging
-logging.basicConfig(
-    level=logging.WARNING,
-    format='%(levelname)s: %(message)s'
+from azure.ai.inference import ChatCompletionsClient
+from azure.ai.inference.models import (
+    SystemMessage, 
+    UserMessage, 
+    AssistantMessage, 
+    ToolMessage, 
+    ChatCompletionsToolCall, 
+    FunctionCall
 )
+from azure.core.credentials import AzureKeyCredential
+from dotenv import load_dotenv
+
+from azure_mcp_server import AzureMCPServer
+from github_mcp_server import GitHubMCPServer
+
+# Setup logging
+logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 load_dotenv()
 
-# Azure OpenAI configuration
+# Azure AI Inference configuration
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_MODEL = os.getenv("AZURE_OPENAI_MODEL", "gpt-4o")
+AZURE_API_KEY = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_KEY")
 
-# Ensure the endpoint has https:// protocol
-if AZURE_OPENAI_ENDPOINT and not AZURE_OPENAI_ENDPOINT.startswith(('http://', 'https://')):
-    AZURE_OPENAI_ENDPOINT = f"https://{AZURE_OPENAI_ENDPOINT}"
+if not AZURE_OPENAI_ENDPOINT or not AZURE_API_KEY:
+    raise ValueError("Missing required environment variables: AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY")
 
-# Validate configuration
-if not AZURE_OPENAI_ENDPOINT:
-    raise ValueError("AZURE_OPENAI_ENDPOINT environment variable is not set")
+def get_inference_endpoint(base_endpoint: str, model: str) -> str:
+    """Convert endpoint format for Azure AI Inference"""
+    if "openai.azure.com" in base_endpoint:
+        resource_name = base_endpoint.split("//")[1].split(".")[0]
+        return f"https://{resource_name}.cognitiveservices.azure.com/openai/deployments/{model}"
+    return base_endpoint
 
-# Initialize Azure credentials
-credential = DefaultAzureCredential()
-token_provider = get_bearer_token_provider(
-    credential, "https://cognitiveservices.azure.com/.default"
-)
+INFERENCE_ENDPOINT = get_inference_endpoint(AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_MODEL)
+
+# Load the verbose system prompt
+def load_system_prompt():
+    """Load system prompt from file"""
+    prompt_file = os.path.join(os.path.dirname(__file__), "..", "prompts", "system_prompt_azure_ai_verbose.txt")
+    if os.path.exists(prompt_file):
+        with open(prompt_file, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    
+    # Fallback verbose prompt if file doesn't exist
+    return """You are an Azure infrastructure expert assistant with comprehensive GitHub and Azure tools.
+
+## COMMUNICATION STYLE - BE EXTREMELY VERBOSE
+Always provide detailed, step-by-step feedback for EVERY action:
+
+🔍 **ANALYZING**: [Always explain what you're examining and why]
+🎯 **OBJECTIVE**: [State the specific goal clearly]  
+📋 **PLAN**: [Break down the steps you'll take]
+🔧 **ACTION**: [Describe exactly what tool you're about to use]
+⏳ **EXECUTING**: [Show what command/tool is running]
+📊 **RESULT**: [Summarize what was found/accomplished]
+💡 **INSIGHT**: [Explain what this means for the task]
+🔄 **NEXT STEP**: [Explain what you'll do next]
+
+Always be educational, thorough, and explain your reasoning step-by-step."""
 
 # Tool categorization for dynamic loading
 TOOL_CATEGORIES = {
     "azure": {
         "keywords": [
             "azure", "subscription", "resource group", "aks", "kubernetes", 
-            "sql", "storage", "cosmos", "keyvault", "monitor", "bicep",
-            "terraform", "virtual desktop", "redis", "postgres", "service bus",
-            "load testing", "grafana", "datadog", "marketplace"
+            "vm", "virtual machine", "storage", "blob", "container", "database",
+            "sql", "cosmos", "policy", "rbac", "management group", "tenant",
+            "activity log", "monitor", "network", "vnet", "subnet", "firewall"
         ],
-        "tools": [
-            "documentation", "bestpractices", "group", "subscription", "aks", 
-            "appconfig", "role", "datadog", "cosmos", "foundry", "grafana",
-            "keyvault", "kusto", "marketplace", "monitor", "postgres", "redis",
-            "search", "servicebus", "sql", "storage", "workbooks", "bicepschema",
-            "virtualdesktop", "azureterraformbestpractices", "loadtesting",
-            "extension_az", "extension_azd", "extension_azqr"
-        ]
+        "default_on": True
     },
     "github": {
         "keywords": [
-            "github", "repository", "repo", "pull request", "pr", "issue", 
-            "commit", "workflow", "actions", "gist", "branch", "fork",
-            "code", "search code", "organization", "user", "notification"
+            "github", "repository", "repo", "commit", "pull request", "pr",
+            "branch", "file", "directory", "code", "readme", "markdown",
+            "issue", "workflow", "action", "clone", "fork", "organization"
         ],
-        "tools": [
-            "add_comment_to_pending_review", "add_issue_comment", "add_sub_issue",
-            "assign_copilot_to_issue", "cancel_workflow_run", "create_and_submit_pull_request_review",
-            "create_branch", "create_gist", "create_issue", "create_or_update_file",
-            "create_pending_pull_request_review", "create_pull_request", "create_repository",
-            "delete_file", "delete_pending_pull_request_review", "delete_workflow_run_logs",
-            "dismiss_notification", "download_workflow_run_artifact", "fork_repository",
-            "get_code_scanning_alert", "get_commit", "get_dependabot_alert", "get_discussion",
-            "get_discussion_comments", "get_file_contents", "get_issue", "get_issue_comments",
-            "get_job_logs", "get_me", "get_notification_details", "get_pull_request",
-            "get_pull_request_comments", "get_pull_request_diff", "get_pull_request_files",
-            "get_pull_request_reviews", "get_pull_request_status", "get_secret_scanning_alert",
-            "get_tag", "get_workflow_run", "get_workflow_run_logs", "get_workflow_run_usage",
-            "list_branches", "list_code_scanning_alerts", "list_commits", "list_dependabot_alerts",
-            "list_discussion_categories", "list_discussions", "list_gists", "list_issues",
-            "list_notifications", "list_pull_requests", "list_secret_scanning_alerts",
-            "list_sub_issues", "list_tags", "list_workflow_jobs", "list_workflow_run_artifacts",
-            "list_workflow_runs", "list_workflows", "manage_notification_subscription",
-            "manage_repository_notification_subscription", "mark_all_notifications_read",
-            "merge_pull_request", "push_files", "remove_sub_issue", "reprioritize_sub_issue",
-            "request_copilot_review", "rerun_failed_jobs", "rerun_workflow_run", "run_workflow",
-            "search_code", "search_issues", "search_orgs", "search_pull_requests",
-            "search_repositories", "search_users", "submit_pending_pull_request_review",
-            "update_gist", "update_issue", "update_pull_request", "update_pull_request_branch"
-        ]
+        "default_on": True
     }
 }
 
-# Always-available basic tools
-BASIC_TOOLS = {
-    "azure": ["documentation", "bestpractices", "subscription"],
-    "github": ["get_me", "search_repositories"]
-}
-
-
-class DynamicToolManager:
-    """Manages dynamic loading and unloading of MCP tool sets"""
+class VerboseDynamicToolManager:
+    """Enhanced tool manager with detailed step-by-step feedback"""
     
     def __init__(self):
-        self.azure_server: Optional[AzureMCPServer] = None
-        self.github_server: Optional[GitHubMCPServer] = None
+        self.azure_server = None
+        self.github_server = None
         self.active_categories: Set[str] = set()
-        self.azure_session_active = False
-        self.github_session_active = False
         self.azure_tools = []
         self.github_tools = []
-    
-    async def analyze_conversation_context(self, messages: List[Dict], current_input: str = "") -> Set[str]:
-        """Analyze conversation to determine needed tool categories"""
-        # Combine all conversation text
-        conversation_text = " ".join([
-            msg.get("content", "") for msg in messages if msg.get("content")
-        ]) + " " + current_input
         
-        conversation_lower = conversation_text.lower()
-        needed_categories = set()
+    async def initialize(self):
+        """Initialize MCP servers"""
+        print("Starting Azure Infrastructure Agent...")
         
-        # Debug: Print what we're analyzing
-        print(f"🔍 Analyzing: '{current_input}'")
+        self.azure_server = AzureMCPServer()
+        await self.azure_server.initialize()
         
-        # Check for category keywords using word boundaries for more precise matching
-        import re
+        self.github_server = GitHubMCPServer()
+        await self.github_server.initialize()
+        
+        await self.load_all_tools()
+        print(f"Agent ready with {len(self.azure_tools)} Azure tools and {len(self.github_tools)} GitHub tools")
+
+    async def load_all_tools(self):
+        """Load tools from both servers"""
+        self.azure_tools = self.azure_server.list_tools()
+        self.github_tools = self.github_server.list_tools()
+        
+        # Activate both categories by default
+        self.active_categories.add("azure")
+        self.active_categories.add("github")
+
+    def detect_needed_categories(self, text: str) -> Set[str]:
+        """Analyze text and determine which tool categories are needed"""
+        text_lower = text.lower()
+        needed = set()
+        
         for category, config in TOOL_CATEGORIES.items():
-            matching_keywords = []
             for keyword in config["keywords"]:
-                # Use word boundaries for better matching, except for single letters or very short terms
-                if len(keyword) <= 2:
-                    # For very short keywords, use exact word matching
-                    pattern = r'\b' + re.escape(keyword) + r'\b'
-                else:
-                    # For longer keywords, allow partial matches but be more restrictive
-                    pattern = r'\b' + re.escape(keyword)
-                
-                if re.search(pattern, conversation_lower):
-                    matching_keywords.append(keyword)
+                if keyword in text_lower:
+                    needed.add(category)
+                    break
+        
+        if not needed:
+            needed = {"azure", "github"}  # Default to both
             
-            if matching_keywords:
-                needed_categories.add(category)
-                print(f"🎯 Detected {category} keywords: {matching_keywords}")
-        
-        # Default to Azure tools if nothing specific detected (more specific default)
-        if not needed_categories:
-            if not messages:  # First conversation - load both
-                needed_categories = {"azure", "github"}
-                print("🚀 First conversation - loading both tool sets")
-            else:  # Subsequent conversations - default to Azure only
-                needed_categories = {"azure"}
-                print("🔧 No specific keywords detected - defaulting to Azure tools")
-        
-        return needed_categories
-    
-    async def initialize_servers(self):
-        """Initialize MCP servers (but don't create sessions yet)"""
-        try:
-            self.azure_server = AzureMCPServer()
-            print("✓ Azure MCP Server initialized")
-        except Exception as e:
-            print(f"⚠ Azure MCP Server initialization failed: {e}")
-        
-        try:
-            self.github_server = GitHubMCPServer()
-            print("✓ GitHub MCP Server initialized")
-        except Exception as e:
-            print(f"⚠ GitHub MCP Server initialization failed: {e}")
-    
-    async def load_category_tools(self, category: str):
-        """Load tools for a specific category"""
-        if category in self.active_categories:
-            return  # Already loaded
-        
-        if category == "azure" and self.azure_server and not self.azure_session_active:
-            try:
-                await self.azure_server.initialize()
-                self.azure_tools = self.azure_server.list_tools()
-                self.azure_session_active = True
-                self.active_categories.add("azure")
-                print(f"🔧 Loaded {len(self.azure_tools)} Azure tools")
-            except Exception as e:
-                print(f"❌ Failed to load Azure tools: {e}")
-        
-        elif category == "github" and self.github_server and not self.github_session_active:
-            try:
-                await self.github_server.initialize()
-                self.github_tools = self.github_server.list_tools()
-                self.github_session_active = True
-                self.active_categories.add("github")
-                print(f"🔧 Loaded {len(self.github_tools)} GitHub tools")
-            except Exception as e:
-                print(f"❌ Failed to load GitHub tools: {e}")
-    
+        return needed
+
+    async def ensure_categories_loaded(self, categories: Set[str]):
+        """Ensure specified tool categories are loaded"""
+        for category in categories:
+            if category not in self.active_categories:
+                print(f"🔧 **LOADING CATEGORY**: {category}")
+                self.active_categories.add(category)
+                print(f"✅ **ACTIVATED**: {category} tools now available")
+
     def get_available_tools(self) -> List[Dict]:
-        """Get formatted tools from all active categories"""
+        """Get formatted tools for the current categories"""
         available_tools = []
         
         if "azure" in self.active_categories and self.azure_server:
@@ -197,305 +156,332 @@ class DynamicToolManager:
             available_tools.extend(self.github_server.formatted_tools or [])
         
         return available_tools
-    
-    async def call_tool(self, tool_name: str, arguments: Dict) -> str:
-        """Route tool call to appropriate server"""
-        # Check Azure tools
-        if "azure" in self.active_categories and tool_name in [tool[0] for tool in self.azure_tools]:
-            return await self.azure_server.call_tool(tool_name, arguments)
+
+    async def call_tool_with_feedback(self, tool_name: str, arguments: Dict) -> str:
+        """Execute tool call silently and return results for natural presentation"""
         
-        # Check GitHub tools
-        elif "github" in self.active_categories and tool_name in [tool[0] for tool in self.github_tools]:
-            return await self.github_server.call_tool(tool_name, arguments)
-        
+        try:
+            # Call the appropriate tool method
+            if "azure" in self.active_categories and tool_name in [tool[0] for tool in self.azure_tools]:
+                result = await self.azure_server.call_tool(tool_name, arguments)
+            elif "github" in self.active_categories and tool_name in [tool[0] for tool in self.github_tools]:
+                result = await self.github_server.call_tool(tool_name, arguments)
+            else:
+                raise Exception(f"Tool {tool_name} not found in active categories: {self.active_categories}")
+            
+            return result
+            
+        except Exception as e:
+            raise
+
+    def _explain_tool_purpose(self, tool_name: str, args: Dict) -> str:
+        """Explain why we're using this specific tool"""
+        explanations = {
+            "get_file_contents": f"Reading {args.get('path', 'file')} to understand its structure and content",
+            "get_repository": f"Getting repository information for {args.get('repo', 'unknown')} to understand setup",
+            "list_directory": f"Exploring {args.get('path', 'directory')} to see file organization",
+            "create_branch": f"Creating branch '{args.get('branch', 'new-branch')}' to isolate our changes",
+            "create_or_update_file": f"Creating/updating {args.get('path', 'file')} with new content",
+            "create_pull_request": f"Opening PR to merge changes from {args.get('head', 'branch')} to {args.get('base', 'main')}",
+            "search_code": f"Searching for '{args.get('q', 'code')}' to find existing implementations",
+            "get_subscriptions": "Retrieving list of Azure subscriptions to understand available resources",
+            "get_resource_groups": f"Getting resource groups in subscription {args.get('subscription_id', 'current')} to see organization",
+            "get_resources": f"Listing resources in {args.get('resource_group_name', 'resource group')} to inventory components",
+        }
+        return explanations.get(tool_name, f"Using {tool_name} to accomplish the current step")
+
+    def _analyze_result(self, tool_name: str, result: str) -> str:
+        """Provide intelligent analysis of tool results"""
+        if tool_name == "get_file_contents":
+            if "policy" in result.lower():
+                return "Found policy-related content - will analyze structure and patterns"
+            elif ".json" in result:
+                return "Found JSON content - will examine for policy definitions"
+            elif "readme" in tool_name.lower():
+                return "Found documentation - will review for contribution guidelines"
+            else:
+                return "Retrieved file content - will analyze for relevant information"
+        elif tool_name == "get_repository":
+            return "Got repository metadata - will use this to understand project structure"
+        elif tool_name == "list_directory":
+            file_count = result.count("\n") if result else 0
+            return f"Found {file_count} items - will examine for relevant files and patterns"
+        elif tool_name == "get_subscriptions":
+            subscription_count = result.count("subscription_id") if result else 0
+            return f"Found {subscription_count} subscriptions - will select appropriate one for operations"
+        elif tool_name == "get_resource_groups":
+            rg_count = result.count("resourceGroup") if result else 0
+            return f"Found {rg_count} resource groups - will analyze for target deployment location"
+        elif tool_name == "create_branch":
+            return "Branch created successfully - ready to make changes in isolation"
+        elif tool_name == "create_or_update_file":
+            return "File operation completed - changes are now ready for review"
+        elif tool_name == "create_pull_request":
+            return "Pull request created - ready for review and collaboration"
         else:
-            raise Exception(f"Tool {tool_name} not found in any active tool category")
-    
-    def get_tool_summary(self) -> str:
-        """Get a summary of currently loaded tools"""
-        summary = []
-        if "azure" in self.active_categories:
-            summary.append(f"Azure ({len(self.azure_tools)} tools)")
-        if "github" in self.active_categories:
-            summary.append(f"GitHub ({len(self.github_tools)} tools)")
-        
-        total_tools = len(self.get_available_tools())
-        return f"{', '.join(summary)} - Total: {total_tools} tools"
-    
-    async def cleanup(self):
-        """Clean up all active sessions with robust error handling"""
+            return "Operation completed successfully - proceeding with next step"
+
+    async def close(self):
+        """Clean shutdown"""
         cleanup_errors = []
         
         # Close Azure server
-        if self.azure_session_active and self.azure_server:
+        if self.azure_server:
             try:
-                # Try graceful close with timeout
                 await asyncio.wait_for(self.azure_server.close(), timeout=1.0)
             except (asyncio.TimeoutError, asyncio.CancelledError, RuntimeError) as e:
                 cleanup_errors.append(f"Azure {type(e).__name__}")
-                # Force cleanup by nullifying references
-                try:
-                    self.azure_server._session = None
-                    self.azure_server._stdio_context = None
-                    self.azure_server._read = None
-                    self.azure_server._write = None
-                except:
-                    pass  # Ignore any errors during force cleanup
             except Exception as e:
                 cleanup_errors.append(f"Azure: {e}")
         
-        # Close GitHub server
-        if self.github_session_active and self.github_server:
+        # Close GitHub server  
+        if self.github_server:
             try:
-                # Try graceful close with timeout
                 await asyncio.wait_for(self.github_server.close(), timeout=1.0)
             except (asyncio.TimeoutError, asyncio.CancelledError, RuntimeError) as e:
                 cleanup_errors.append(f"GitHub {type(e).__name__}")
-                # Force cleanup by nullifying references
-                try:
-                    self.github_server._session = None
-                    self.github_server._stdio_context = None
-                    self.github_server._read = None
-                    self.github_server._write = None
-                except:
-                    pass  # Ignore any errors during force cleanup
             except Exception as e:
                 cleanup_errors.append(f"GitHub: {e}")
         
-        # Force reset state regardless of cleanup success
-        self.azure_session_active = False
-        self.github_session_active = False
-        self.active_categories.clear()
-        
         if cleanup_errors:
-            print(f"⚠ Cleanup warnings: {', '.join(cleanup_errors)}")
+            print(f"Cleanup completed with warnings: {', '.join(cleanup_errors)}")
         else:
-            print("✓ Resources cleaned up successfully")
+            print("Clean shutdown completed")
 
-
-async def run():
-    # Initialize Azure OpenAI client
-    client = AzureOpenAI(
-        azure_endpoint=AZURE_OPENAI_ENDPOINT,
-        api_version="2024-04-01-preview",
-        azure_ad_token_provider=token_provider,
-    )
-
-    # Initialize dynamic tool manager
-    tool_manager = DynamicToolManager()
-    await tool_manager.initialize_servers()
+def convert_to_inference_messages(messages: List[Dict]) -> List:
+    """Convert conversation messages to Azure AI Inference format"""
+    inference_messages = []
     
-    # Start conversational loop with dynamic tool loading
-    await run_conversation_loop(client, tool_manager)
-
-
-async def run_conversation_loop(client, tool_manager: DynamicToolManager):
-    """Run the main conversation loop with dynamic tool loading"""
-    messages = []
-    print("\n🤖 Infrastructure Agent with Dynamic Tool Loading")
-    print("💡 Tools will be loaded automatically based on your conversation context")
-    print("📝 Type 'exit' to quit, 'tools' to see loaded tools\n")
-    
-    while True:
-        try:
-            user_input = input("Prompt: ")
-            if user_input.lower() == 'exit':
-                break
-            elif user_input.lower() == 'tools':
-                print(f"📦 Currently loaded: {tool_manager.get_tool_summary()}")
-                continue
-            
-            # Analyze what tools might be needed for this conversation
-            needed_categories = await tool_manager.analyze_conversation_context(messages, user_input)
-            
-            # Load any new tool categories that are needed
-            newly_loaded = []
-            for category in needed_categories:
-                if category not in tool_manager.active_categories:
-                    await tool_manager.load_category_tools(category)
-                    newly_loaded.append(category)
-            
-            # Show what was loaded
-            if newly_loaded:
-                print(f"🔧 Loaded {', '.join(newly_loaded)} tools for this conversation")
-            
-            messages.append({"role": "user", "content": user_input})
-            available_tools = tool_manager.get_available_tools()
-            
-            if not available_tools:
-                print("⚠ No tools available. Please check your configuration.")
-                continue
-            
-            # First API call with tool configuration
-            response = client.chat.completions.create(
-                model=AZURE_OPENAI_MODEL,
-                messages=messages,
-                tools=available_tools,
-                stream=True,
+    for msg in messages:
+        role = msg["role"]
+        content = msg["content"]
+        
+        if role == "system":
+            inference_messages.append(SystemMessage(content=content))
+        elif role == "user":
+            inference_messages.append(UserMessage(content=content))
+        elif role == "assistant":
+            if "tool_calls" in msg and msg["tool_calls"]:
+                tool_calls = []
+                for tool_call in msg["tool_calls"]:
+                    tool_calls.append(
+                        ChatCompletionsToolCall(
+                            id=tool_call["id"],
+                            function=FunctionCall(
+                                name=tool_call["function"]["name"],
+                                arguments=tool_call["function"]["arguments"]
+                            )
+                        )
+                    )
+                inference_messages.append(
+                    AssistantMessage(content=content, tool_calls=tool_calls)
+                )
+            else:
+                inference_messages.append(AssistantMessage(content=content))
+        elif role == "tool":
+            inference_messages.append(
+                ToolMessage(content=content, tool_call_id=msg["tool_call_id"])
             )
+    
+    return inference_messages
 
-            # Process the streaming response
-            response_message = {"role": "assistant", "content": "", "tool_calls": []}
-            current_tool_call = None
-            
-            for chunk in response:
-                if chunk.choices and chunk.choices[0].delta:
-                    delta = chunk.choices[0].delta
-                    
-                    # Handle content streaming
-                    if delta.content:
-                        if not response_message["content"]:
-                            print("\nAssistant: ", end="", flush=True)
-                        print(delta.content, end="", flush=True)
-                        response_message["content"] += delta.content
-                    
-                    # Handle tool call streaming
-                    if delta.tool_calls:
-                        for tool_call in delta.tool_calls:
-                            if tool_call.index is not None:
-                                # Ensure we have enough tool calls in our list
-                                while len(response_message["tool_calls"]) <= tool_call.index:
-                                    response_message["tool_calls"].append({
-                                        "id": "",
-                                        "type": "function",
-                                        "function": {"name": "", "arguments": ""}
-                                    })
-                                
-                                current_tool_call = response_message["tool_calls"][tool_call.index]
-                                
-                                if tool_call.id:
-                                    current_tool_call["id"] = tool_call.id
-                                if tool_call.function:
-                                    if tool_call.function.name:
-                                        current_tool_call["function"]["name"] = tool_call.function.name
-                                    if tool_call.function.arguments:
-                                        current_tool_call["function"]["arguments"] += tool_call.function.arguments
+def should_continue_autonomously(message_content: str) -> bool:
+    """Detect if the agent wants to continue with more steps"""
+    continuation_indicators = [
+        "CONTINUING:",
+        "Now, I will automatically",
+        "Next, I will",
+        "Now I'll",
+        "Proceeding to",
+        "Moving on to",
+        "Next step:",
+        "I will now",
+        "Let me now",
+        "Now checking",
+        "Now listing",
+        "Now enumerating",
+        "automatically enumerate",
+        "automatically check",
+        "automatically review",
+        "automatically analyze"
+    ]
+    
+    message_lower = message_content.lower()
+    for indicator in continuation_indicators:
+        if indicator.lower() in message_lower:
+            return True
+    return False
 
-            # Clean up empty content if we only had tool calls
-            if not response_message["content"] and response_message["tool_calls"]:
-                response_message["content"] = None
+def extract_continuation_action(message_content: str) -> str:
+    """Extract what action the agent wants to continue with"""
+    message_lower = message_content.lower()
+    
+    # Common continuation patterns
+    if "enumerate" in message_lower and "resource group" in message_lower:
+        return "list all resource groups"
+    elif "enumerate" in message_lower and "resource" in message_lower:
+        return "enumerate resources in each resource group"
+    elif "check" in message_lower and "resource" in message_lower:
+        return "check resources in all resource groups"
+    elif "network" in message_lower and ("subnet" in message_lower or "vnet" in message_lower):
+        return "analyze network infrastructure including VNets and subnets"
+    elif "aks" in message_lower or "kubernetes" in message_lower:
+        return "review AKS clusters and their configuration"
+    elif "storage" in message_lower:
+        return "analyze storage accounts and configurations"
+    elif "security" in message_lower or "keyvault" in message_lower:
+        return "review security configurations including Key Vault"
+    
+    # Generic continuation
+    if "continuing" in message_lower:
+        return "continue with the next step"
+    
+    return None
+
+async def main():
+    """Main conversation loop with autonomous execution"""
+    print("Azure Infrastructure Agent")
+    print("-" * 40)
+    
+    # Initialize the tool manager
+    tool_manager = VerboseDynamicToolManager()
+    await tool_manager.initialize()
+    
+    # Initialize the client
+    client = ChatCompletionsClient(
+        endpoint=INFERENCE_ENDPOINT,
+        credential=AzureKeyCredential(AZURE_API_KEY)
+    )
+    
+    # Start conversation
+    messages = [{"role": "system", "content": load_system_prompt()}]
+    
+    print("Agent ready! Type your requests below.")
+    print("-" * 40)
+    
+    try:
+        while True:
+            # Check if we have a continuation action or need user input
+            if 'user_input' not in locals():
+                # Get user input
+                user_input = input("\nYou: ").strip()
+                
+                if user_input.lower() in ['exit', 'quit', 'bye']:
+                    print("Goodbye!")
+                    break
+                
+                if not user_input:
+                    continue
             
-            # Clean up empty tool calls
-            if not any(tc["function"]["name"] for tc in response_message["tool_calls"]):
-                response_message["tool_calls"] = None
+            # Detect and ensure needed tool categories (silent)
+            needed_categories = tool_manager.detect_needed_categories(user_input)
+            await tool_manager.ensure_categories_loaded(needed_categories)
             
-            # Convert to the format expected by the messages list
-            if response_message["tool_calls"]:
-                # Convert our format to OpenAI's expected format
-                formatted_tool_calls = []
-                for tc in response_message["tool_calls"]:
-                    if tc["function"]["name"]:  # Only include valid tool calls
-                        formatted_tool_calls.append({
-                            "id": tc["id"],
-                            "type": "function", 
+            # Add user message
+            messages.append({"role": "user", "content": user_input})
+            
+            # Get available tools
+            tools = tool_manager.get_available_tools()
+            
+            # Make API call
+            inference_messages = convert_to_inference_messages(messages)
+            
+            response = client.complete(
+                messages=inference_messages,
+                tools=tools,
+                tool_choice="auto",
+                temperature=0.7,
+                max_tokens=2000
+            )
+            
+            assistant_message = response.choices[0].message
+            
+            # Handle tool calls
+            if assistant_message.tool_calls:
+                # Add assistant message with tool calls
+                messages.append({
+                    "role": "assistant", 
+                    "content": assistant_message.content,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
                             "function": {
-                                "name": tc["function"]["name"],
-                                "arguments": tc["function"]["arguments"]
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments
                             }
+                        } for tc in assistant_message.tool_calls
+                    ]
+                })
+                
+                # Execute each tool call
+                for tool_call in assistant_message.tool_calls:
+                    function_name = tool_call.function.name
+                    function_args = json.loads(tool_call.function.arguments)
+                    
+                    try:
+                        # Use concise tool calling
+                        content = await tool_manager.call_tool_with_feedback(function_name, function_args)
+                        
+                        # Add tool result
+                        messages.append({
+                            "role": "tool",
+                            "content": content,
+                            "tool_call_id": tool_call.id
+                        })
+                        
+                    except Exception as e:
+                        error_content = f"Error calling {function_name}: {str(e)}"
+                        print(f"TOOL ERROR: {error_content}")
+                        messages.append({
+                            "role": "tool",
+                            "content": error_content,
+                            "tool_call_id": tool_call.id
                         })
                 
-                response_dict = {
-                    "role": "assistant",
-                    "content": response_message["content"],
-                    "tool_calls": formatted_tool_calls if formatted_tool_calls else None
-                }
-            else:
-                response_dict = {
-                    "role": "assistant", 
-                    "content": response_message["content"]
-                }
+                # Get final response after tool execution
+                inference_messages = convert_to_inference_messages(messages)
                 
-            messages.append(response_dict)
-
-            # Handle function calls
-            if response_dict.get("tool_calls"):
-                for tool_call in response_dict["tool_calls"]:
-                    try:
-                        function_name = tool_call["function"]["name"]
-                        function_args = json.loads(tool_call["function"]["arguments"])
-                        
-                        # Use the tool manager to route the call
-                        content = await tool_manager.call_tool(function_name, function_args)
-                        
-                        # Add the tool response to messages
-                        messages.append(
-                            {
-                                "tool_call_id": tool_call["id"],
-                                "role": "tool",
-                                "name": function_name,
-                                "content": content,
-                            }
-                        )
-                    except Exception as e:
-                        logger.error(f"Error calling tool {function_name}: {e}")
-                        messages.append(
-                            {
-                                "tool_call_id": tool_call["id"],
-                                "role": "tool",
-                                "name": function_name,
-                                "content": f"Error calling tool: {str(e)}",
-                            }
-                        )
-
-                # Get the final response from the model after tool calls
-                final_response = client.chat.completions.create(
-                    model=AZURE_OPENAI_MODEL,
-                    messages=messages,
-                    tools=available_tools,
-                    stream=True,
+                final_response = client.complete(
+                    messages=inference_messages,
+                    temperature=0.7,
+                    max_tokens=2000
                 )
-
-                # Stream the final response
-                print("\nAssistant: ", end="", flush=True)
-                for chunk in final_response:
-                    if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                        print(chunk.choices[0].delta.content, end="", flush=True)
-                print()  # New line after streaming
-            elif response_dict.get("content"):
-                print()  # New line after streaming if we had content but no tool calls
+                
+                final_message = final_response.choices[0].message.content
+                messages.append({"role": "assistant", "content": final_message})
+                
+                print(f"\nAssistant: {final_message}")
+                
+                # Check for autonomous continuation
+                if should_continue_autonomously(final_message):
+                    continue_action = extract_continuation_action(final_message)
+                    if continue_action:
+                        user_input = continue_action  # Set for next iteration
+                        continue  # Loop back to process continuation
+                
+            else:
+                # No tool calls, just regular response
+                messages.append({"role": "assistant", "content": assistant_message.content})
+                print(f"\nAssistant: {assistant_message.content}")
+                
+                # Check for autonomous continuation
+                if should_continue_autonomously(assistant_message.content):
+                    continue_action = extract_continuation_action(assistant_message.content)
+                    if continue_action:
+                        user_input = continue_action  # Set for next iteration
+                        continue  # Loop back to process continuation
             
-        except KeyboardInterrupt:
-            print("\nExiting...")
-            break
-        except Exception as e:
-            print(f"An error occurred: {e}")
-            
-            # Try to recover by resetting the conversation if it's a connection error
-            if "connection" in str(e).lower():
-                print("Connection error detected. You may need to restart the script.")
-                break
+            # Clear user_input for next iteration (if no continuation)
+            del user_input
     
-    # Cleanup with better error handling
-    print("\n🧹 Cleaning up resources...")
-    try:
-        # Use a short timeout for cleanup during shutdown
-        await asyncio.wait_for(tool_manager.cleanup(), timeout=3.0)
-    except asyncio.TimeoutError:
-        print("⚠ Cleanup timed out - forcing shutdown")
+    except KeyboardInterrupt:
+        print("\n\n🛑 **INTERRUPTED**: Shutting down gracefully...")
     except Exception as e:
-        print(f"⚠ Cleanup warnings: {e}")
+        print(f"\n❌ **ERROR**: An unexpected error occurred: {str(e)}")
+    
     finally:
-        print("👋 Goodbye!")
-
+        await tool_manager.close()
+        print("✅ **SHUTDOWN COMPLETE**: All resources cleaned up")
 
 if __name__ == "__main__":
-    async def shutdown_handler(tool_manager=None):
-        """Handle graceful shutdown"""
-        if tool_manager:
-            print("\n🛑 Shutdown signal received - cleaning up...")
-            try:
-                await asyncio.wait_for(tool_manager.cleanup(), timeout=3.0)
-            except asyncio.TimeoutError:
-                print("⚠ Cleanup timed out during shutdown")
-            except Exception as e:
-                print(f"⚠ Cleanup error during shutdown: {e}")
-        print("👋 Goodbye!")
-    
-    try:
-        asyncio.run(run())
-    except KeyboardInterrupt:
-        print("\n🛑 Interrupted by user")
-        sys.exit(0)
-    except Exception as e:
-        logger.error(f"Application error: {e}")
-        sys.exit(1)
+    asyncio.run(main())
