@@ -21,21 +21,45 @@ from dotenv import load_dotenv
 from azure_mcp_server import AzureMCPServer
 from github_mcp_server import GitHubMCPServer
 
-# Configure logging to show only warnings and errors
-logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(message)s')
-logger = logging.getLogger(__name__)
-
-# Load environment variables from .env file
+# Load environment variables from .env file first
 load_dotenv()
+
+# Configure logging based on environment variable
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# Set up logging configuration
+if LOG_LEVEL == "NONE" or not LOG_LEVEL:
+    # Disable logging completely
+    logging.basicConfig(level=logging.CRITICAL + 1)  # Higher than CRITICAL to disable all
+    logger = logging.getLogger(__name__)
+    logger.disabled = True
+else:
+    # Map string levels to logging constants
+    level_map = {
+        "DEBUG": logging.DEBUG,
+        "INFO": logging.INFO, 
+        "WARNING": logging.WARNING,
+        "ERROR": logging.ERROR,
+        "CRITICAL": logging.CRITICAL
+    }
+    
+    log_level = level_map.get(LOG_LEVEL, logging.INFO)
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s - %(name)s - %(levelname)s: %(message)s',
+        datefmt='%H:%M:%S'
+    )
+    logger = logging.getLogger(__name__)
 
 # Get Azure OpenAI configuration from environment variables
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_MODEL = os.getenv("AZURE_OPENAI_MODEL", "gpt-4o")  # Default to gpt-4o
 AZURE_API_KEY = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_KEY")
+AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")  # Default to latest preview version
 
 # Ensure required environment variables are present
 if not AZURE_OPENAI_ENDPOINT or not AZURE_API_KEY:
-    raise ValueError("Missing required environment variables: AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY")
+    raise ValueError("Missing required environment variables: AZURE_OPENAI_ENDPOINT and AZURE_API_KEY")
 
 def get_inference_endpoint(base_endpoint: str, model: str) -> str:
     """Convert Azure OpenAI endpoint to Azure AI Inference format"""
@@ -82,19 +106,45 @@ class SimpleToolManager:
     async def initialize(self):
         """Initialize both MCP servers"""
         print("Starting Azure Infrastructure Agent...")
+        logger.info("Initializing MCP tool servers...")
         
         # Create and initialize Azure MCP server
-        self.azure_server = AzureMCPServer()
-        await self.azure_server.initialize()
+        try:
+            logger.info("Loading Azure MCP server...")
+            self.azure_server = AzureMCPServer()
+            await self.azure_server.initialize()
+            
+            # Log available Azure tools
+            azure_tools = self.azure_server.list_tools() if self.azure_server else []
+            logger.info(f"Azure MCP server loaded with {len(azure_tools)} tools:")
+            for tool_name, tool_desc in azure_tools:
+                logger.info(f"  - {tool_name}: {tool_desc}")
+                
+        except Exception as e:
+            logger.error(f"Failed to initialize Azure MCP server: {e}")
+            self.azure_server = None
         
         # Create and initialize GitHub MCP server  
-        self.github_server = GitHubMCPServer()
-        await self.github_server.initialize()
+        try:
+            logger.info("Loading GitHub MCP server...")
+            self.github_server = GitHubMCPServer()
+            await self.github_server.initialize()
+            
+            # Log available GitHub tools
+            github_tools = self.github_server.list_tools() if self.github_server else []
+            logger.info(f"GitHub MCP server loaded with {len(github_tools)} tools:")
+            for tool_name, tool_desc in github_tools:
+                logger.info(f"  - {tool_name}: {tool_desc}")
+                
+        except Exception as e:
+            logger.error(f"Failed to initialize GitHub MCP server: {e}")
+            self.github_server = None
         
         # Get tool counts for user feedback
         azure_tools = len(self.azure_server.list_tools()) if self.azure_server else 0
         github_tools = len(self.github_server.list_tools()) if self.github_server else 0
         
+        logger.info(f"Tool initialization complete. Total: {azure_tools + github_tools} tools")
         print(f"Agent ready with {azure_tools} Azure tools and {github_tools} GitHub tools")
 
     def get_available_tools(self) -> List[Dict]:
@@ -114,19 +164,32 @@ class SimpleToolManager:
     async def call_tool(self, tool_name: str, arguments: Dict) -> str:
         """Execute a tool call on the appropriate server"""
         try:
+            # Log the tool call attempt
+            logger.info(f"🔧 Calling tool: {tool_name}")
+            logger.info(f"📝 Arguments: {json.dumps(arguments, indent=2)}")
+            
             # Get list of Azure tool names
             azure_tool_names = [tool[0] for tool in self.azure_server.list_tools()] if self.azure_server else []
             
             # Check if this is an Azure tool
             if tool_name in azure_tool_names:
-                return await self.azure_server.call_tool(tool_name, arguments)
+                logger.info(f"🔵 Routing to Azure MCP server...")
+                result = await self.azure_server.call_tool(tool_name, arguments)
+                logger.info(f"✅ Azure tool '{tool_name}' completed successfully")
+                logger.info(f"📤 Result length: {len(str(result))} characters")
+                return result
             
             # Otherwise try GitHub server
             elif self.github_server:
-                return await self.github_server.call_tool(tool_name, arguments)
+                logger.info(f"🐙 Routing to GitHub MCP server...")
+                result = await self.github_server.call_tool(tool_name, arguments)
+                logger.info(f"✅ GitHub tool '{tool_name}' completed successfully")
+                logger.info(f"📤 Result length: {len(str(result))} characters")
+                return result
             
             # Tool not found in either server
             else:
+                logger.error(f"❌ Tool '{tool_name}' not found in any server")
                 raise Exception(f"Tool {tool_name} not found in any server")
                 
         except Exception as e:
@@ -137,29 +200,35 @@ class SimpleToolManager:
         """Clean shutdown of both servers"""
         cleanup_errors = []
         
-        # Close Azure server with timeout and better error handling
+        # Close Azure server gracefully - let MCP handle its own task management
         if self.azure_server:
             try:
-                await asyncio.wait_for(self.azure_server.close(), timeout=2.0)
+                # Give the server a chance to close normally, but don't force timeout
+                close_task = asyncio.create_task(self.azure_server.close())
+                await asyncio.wait_for(close_task, timeout=1.0)
             except asyncio.TimeoutError:
-                cleanup_errors.append("Azure: Timeout during shutdown")
-            except asyncio.CancelledError:
-                cleanup_errors.append("Azure: Shutdown cancelled")
+                # Don't cancel, just log the timeout
+                cleanup_errors.append("Azure: Clean shutdown timeout (continuing)")
             except Exception as e:
-                cleanup_errors.append(f"Azure: {type(e).__name__}")
+                # Suppress cancel scope errors from MCP internals
+                if "cancel scope" not in str(e).lower():
+                    cleanup_errors.append(f"Azure: {type(e).__name__}")
         
-        # Close GitHub server with timeout and better error handling
+        # Close GitHub server gracefully - let MCP handle its own task management  
         if self.github_server:
             try:
-                await asyncio.wait_for(self.github_server.close(), timeout=2.0)
+                # Give the server a chance to close normally, but don't force timeout
+                close_task = asyncio.create_task(self.github_server.close())
+                await asyncio.wait_for(close_task, timeout=1.0)
             except asyncio.TimeoutError:
-                cleanup_errors.append("GitHub: Timeout during shutdown")
-            except asyncio.CancelledError:
-                cleanup_errors.append("GitHub: Shutdown cancelled")
+                # Don't cancel, just log the timeout
+                cleanup_errors.append("GitHub: Clean shutdown timeout (continuing)")
             except Exception as e:
-                cleanup_errors.append(f"GitHub: {type(e).__name__}")
+                # Suppress cancel scope errors from MCP internals
+                if "cancel scope" not in str(e).lower():
+                    cleanup_errors.append(f"GitHub: {type(e).__name__}")
         
-        # Report any cleanup issues (but don't crash)
+        # Report any significant cleanup issues (but don't crash)
         if cleanup_errors:
             print(f"Cleanup completed with warnings: {', '.join(cleanup_errors)}")
         else:
@@ -219,10 +288,15 @@ async def main():
     tool_manager = SimpleToolManager()
     await tool_manager.initialize()
     
+    # Log available tools summary
+    available_tools = tool_manager.get_available_tools()
+    logger.info(f"🛠️  Agent ready with {len(available_tools)} total tools available")
+    
     # Create Azure AI Inference client
     client = ChatCompletionsClient(
         endpoint=INFERENCE_ENDPOINT,
-        credential=AzureKeyCredential(AZURE_API_KEY)
+        credential=AzureKeyCredential(AZURE_API_KEY),
+        api_version=AZURE_API_VERSION
     )
     
     # Start conversation with system prompt
@@ -249,8 +323,12 @@ async def main():
             # Add user message to conversation
             messages.append({"role": "user", "content": user_input})
             
+            # Log the user query
+            logger.info(f"👤 User query: {user_input}")
+            
             # Get available tools from both servers
             tools = tool_manager.get_available_tools()
+            logger.info(f"🔍 Making AI request with {len(tools)} tools available")
             
             # Convert messages to Azure AI Inference format
             inference_messages = convert_to_inference_messages(messages)
@@ -260,8 +338,6 @@ async def main():
                 messages=inference_messages,
                 tools=tools,
                 tool_choice="auto",  # Let AI decide when to use tools
-                temperature=0.7,     # Creativity level
-                max_tokens=2000,     # Maximum response length
                 stream=True          # Enable streaming responses
             )
             
@@ -294,8 +370,6 @@ async def main():
                 messages=inference_messages,
                 tools=tools,
                 tool_choice="auto",
-                temperature=0.7,
-                max_tokens=2000,
                 stream=False  # Non-streaming to get complete tool calls
             )
             
@@ -328,8 +402,14 @@ async def main():
                     function_args = json.loads(tool_call.function.arguments)
                     
                     try:
+                        logger.info(f"🤖 AI requested tool: {function_name}")
+                        print(f"Executing tool: {function_name}...")
+                        
                         # Execute the tool
                         content = await tool_manager.call_tool(function_name, function_args)
+                        
+                        logger.info(f"📋 Tool result preview: {str(content)[:200]}...")
+                        print(f"Tool {function_name} completed.")
                         
                         # Add tool result to conversation (following Azure SDK pattern)
                         messages.append({
@@ -354,8 +434,6 @@ async def main():
                 final_response = client.complete(
                     messages=inference_messages,
                     tools=tools,
-                    temperature=0.7,
-                    max_tokens=2000,
                     stream=True  # Stream the final response
                 )
                 
@@ -388,9 +466,15 @@ async def main():
         print(f"\nERROR: An unexpected error occurred: {str(e)}")
     
     finally:
-        # Always clean up resources
-        await tool_manager.close()
-        print("Shutdown complete")
+        # Always clean up resources - suppress any asyncio context errors
+        try:
+            await tool_manager.close()
+            print("Shutdown complete")
+        except Exception as cleanup_error:
+            # Suppress MCP internal task/context errors but show real issues
+            if "cancel scope" not in str(cleanup_error).lower() and "CancelledError" not in str(cleanup_error):
+                print(f"Warning during cleanup: {cleanup_error}")
+            print("Shutdown complete")
 
 # Run the agent when script is executed directly
 if __name__ == "__main__":
