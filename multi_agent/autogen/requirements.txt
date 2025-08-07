@@ -1,4 +1,4 @@
-# AutoGen 0.7.2 packages (confirmed working)
+# AutoGen 0.7.2 packages
 autogen-agentchat>=0.7.2
 autogen-core>=0.7.2
 autogen-ext[openai]>=0.7.2
