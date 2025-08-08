@@ -78,6 +78,23 @@ def create_mcp_server_params():
     except Exception as e:
         print(f"❌ Azure MCP server params creation failed: {e}")
     
+    # Azure DevOps MCP server parameters (requires ADO_ORG)
+    try:
+        ado_org = os.getenv("ADO_ORG")
+        if ado_org:
+            print("🔄 Creating Azure DevOps MCP server params...")
+            ado_server_params = StdioServerParams(
+                command="npx",
+                args=["-y", "@azure-devops/mcp", ado_org],
+            )
+            server_params.append(ado_server_params)
+            print("✅ Azure DevOps MCP server params created")
+        else:
+            print("❌ ADO_ORG not set - skipping Azure DevOps MCP")
+    except Exception as e:
+        print(f"❌ Azure DevOps MCP server params creation failed: {e}")
+        print("🔄 Continuing without Azure DevOps MCP server")
+    
     # GitHub MCP server parameters (with environment variables)
     try:
         github_token = os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN")
@@ -105,7 +122,7 @@ def create_mcp_server_params():
     except Exception as e:
         print(f"❌ GitHub MCP server params creation failed: {e}")
         print("🔄 Continuing without GitHub MCP server")
-
+    
     # Playwright MCP server (web browsing)
     try:
         print("🔄 Creating Playwright MCP server params...")
@@ -120,27 +137,22 @@ def create_mcp_server_params():
     
     return server_params
 
-async def run_agent_system(workbenches: Optional[List[McpWorkbench]]):
+async def run_agent_system(workbenches: Optional[List[McpWorkbench]], bench_indices: Optional[dict] = None):
     """Run the agent system with optional MCP workbenches"""
     
     print("✅ MagenticOne agent team setup ready")
     print(f"🔍 MCP workbenches: {'✅ Available' if workbenches else '❌ Not available'}")
-    has_github = bool(workbenches and len(workbenches) > 1)
-    # Playwright index depends on whether GitHub workbench is present
-    has_playwright = bool(workbenches and ((has_github and len(workbenches) > 2) or (not has_github and len(workbenches) > 1)))
+    bench_indices = bench_indices or {}
+    
+    has_ado = "ado" in bench_indices
+    has_github = "github" in bench_indices
+    has_playwright = "playwright" in bench_indices
     has_infracoder = bool(has_github)
-    if has_github:
-        print("📱 GitHub agent: ✅ Enabled")
-    else:
-        print("📱 GitHub agent: ❌ Not available (check GITHUB_PERSONAL_ACCESS_TOKEN)")
-    if has_playwright:
-        print("🌐 Playwright agent: ✅ Enabled")
-    else:
-        print("🌐 Playwright agent: ❌ Not available")
-    if has_infracoder:
-        print("🧩 InfraCoder agent: ✅ Enabled")
-    else:
-        print("🧩 InfraCoder agent: ❌ Not available (requires GitHub MCP)")
+    
+    print(f"🏢 Azure DevOps agent: {'✅ Enabled' if has_ado else '❌ Not available (set ADO_ORG)'}")
+    print(f"📱 GitHub agent: {'✅ Enabled' if has_github else '❌ Not available (check GITHUB_PERSONAL_ACCESS_TOKEN)'}")
+    print(f"🌐 Playwright agent: {'✅ Enabled' if has_playwright else '❌ Not available'}")
+    print(f"🧩 InfraCoder agent: {'✅ Enabled' if has_infracoder else '❌ Not available (requires GitHub MCP)'}")
     print("-" * 50)
 
     # Use MagenticOneGroupChat (as originally requested)
@@ -244,14 +256,37 @@ async def run_agent_system(workbenches: Optional[List[McpWorkbench]]):
                 # Create participants list
                 participants = [coordinator_agent, azure_agent, user_proxy]
                 
-                # Add GitHub agent if available (with MCP error handling)
-                if has_github:
+                # Add Azure DevOps agent if available
+                if has_ado and workbenches:
                     try:
+                        ado_index = bench_indices["ado"]
+                        ado_agent = AssistantAgent(
+                            name=f"AdoAgent_{request_count}",
+                            description="An agent for Azure DevOps (Repos, Boards, Pipelines, Test, Security).",
+                            model_client=azure_model_client,
+                            workbench=workbenches[ado_index],
+                            model_client_stream=True,
+                            max_tool_iterations=10,
+                            system_message="""
+                            You are an Azure DevOps expert with access to live Azure DevOps MCP tools.
+                            Always call the available tools for Projects, Repos, Pull Requests, Work Items, Builds, and Releases.
+                            Return real data only; do not invent.
+                            """,
+                        )
+                        participants.insert(2, ado_agent)
+                    except Exception as ado_error:
+                        print(f"⚠️  Azure DevOps agent creation failed: {ado_error}")
+                        has_ado = False
+                
+                # Add GitHub agent if available (with MCP error handling)
+                if has_github and workbenches:
+                    try:
+                        github_index = bench_indices["github"]
                         github_agent = AssistantAgent(
                             name=f"GitHubAgent_{request_count}",
                             description="An agent for GitHub repository analysis.",
                             model_client=azure_model_client,
-                            workbench=workbenches[1],
+                            workbench=workbenches[github_index],
                             model_client_stream=True,
                             max_tool_iterations=10,
                             system_message="""
@@ -276,12 +311,11 @@ async def run_agent_system(workbenches: Optional[List[McpWorkbench]]):
                         has_github = False
 
                 # Add InfraCoder agent if available (uses GitHub + optional Playwright)
-                if has_infracoder:
+                if has_infracoder and workbenches:
                     try:
-                        pw_index = 2 if has_github else 1
-                        coder_workbenches = [workbenches[1]]
+                        coder_workbenches = [workbenches[bench_indices["github"]]]
                         if has_playwright:
-                            coder_workbenches.append(workbenches[pw_index])
+                            coder_workbenches.append(workbenches[bench_indices["playwright"]])
                         infracoder_agent = AssistantAgent(
                             name=f"InfraCoderAgent_{request_count}",
                             description="An agent for Terraform/Bicep coding tasks: browse AVM modules, analyze repos, create branches and PRs.",
@@ -319,14 +353,13 @@ async def run_agent_system(workbenches: Optional[List[McpWorkbench]]):
                         has_infracoder = False
 
                 # Add Playwright web agent if available
-                if has_playwright:
+                if has_playwright and workbenches:
                     try:
-                        pw_index = 2 if has_github else 1
                         web_agent = AssistantAgent(
                             name=f"WebAgent_{request_count}",
                             description="An agent for web browsing and scraping using Playwright MCP.",
                             model_client=azure_model_client,
-                            workbench=workbenches[pw_index],
+                            workbench=workbenches[bench_indices["playwright"]],
                             model_client_stream=True,
                             max_tool_iterations=10,
                             system_message="""
@@ -399,6 +432,7 @@ async def main():
         else:
             # Create list of workbenches for multiple MCP servers with error handling
             workbenches = []
+            bench_indices = {}
             for i, params in enumerate(server_params_list):
                 try:
                     workbench = McpWorkbench(params)
@@ -406,12 +440,16 @@ async def main():
                     args_str = " ".join(str(a) for a in getattr(params, "args", [])).lower()
                     if "@azure/mcp" in args_str:
                         server_type = "Azure"
+                        bench_indices["azure"] = i
                     elif "@azure-devops/mcp" in args_str or "azure-devops" in args_str:
                         server_type = "Azure DevOps"
+                        bench_indices["ado"] = i
                     elif "github-mcp" in args_str or "server-github" in args_str:
                         server_type = "GitHub"
+                        bench_indices["github"] = i
                     elif "@playwright/mcp" in args_str:
                         server_type = "Playwright"
+                        bench_indices["playwright"] = i
                     else:
                         server_type = "MCP"
                     print(f"✅ Created {server_type} MCP workbench")
@@ -441,7 +479,7 @@ async def main():
         # Use context manager for proper resource management
         if workbenches:
             async with workbenches[0] if len(workbenches) == 1 else workbenches[0]:  # Simplified for demo
-                await run_agent_system(workbenches)
+                await run_agent_system(workbenches, bench_indices)
         else:
             await run_agent_system(None)
                 

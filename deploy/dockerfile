@@ -1,16 +1,21 @@
 # Multi-stage Dockerfile for Azure Container Apps deployment
-FROM node:18-alpine AS node-base
+FROM node:20-alpine AS node-base
 
-# Install Azure MCP server globally
-RUN npm install -g @azure/mcp@latest
+# Install Azure MCP server and Azure DevOps MCP globally
+RUN npm install -g @azure/mcp@latest @azure-devops/mcp@latest
 
 FROM python:3.11-slim AS python-base
 
-# Install system dependencies
+# Install system dependencies (incl. Azure CLI for ADO auth flows)
 RUN apt-get update && apt-get install -y \
     curl \
     git \
+    ca-certificates \
+    gnupg \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Azure CLI
+RUN curl -sL https://aka.ms/InstallAzureCLIDeb | bash || true
 
 # Copy Node.js and npm from node image
 COPY --from=node-base /usr/local/bin/node /usr/local/bin/
@@ -31,6 +36,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY agent/ ./agent/
+COPY multi_agent/ ./multi_agent/
 COPY .env* ./
 
 # Create non-root user for security
@@ -49,5 +55,5 @@ ENV NODE_PATH=/usr/local/lib/node_modules
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import sys; sys.exit(0)"
 
-# Default command - run the infrastructure agent
-CMD ["python", "agent/main.py"]
+# Default command - run the autogen v2 agent (can be overridden)
+CMD ["python", "multi_agent/autogen/autogen_agent_v2.py"]
