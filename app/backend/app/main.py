@@ -36,7 +36,8 @@ async def stream_agent_output(prompt: str):
 @app.post("/run")
 async def run(req: RunRequest):
     try:
-        return StreamingResponse(stream_agent_output(req.prompt), media_type="text/plain")
+        # Stream as NDJSON for structured events
+        return StreamingResponse(stream_agent_output(req.prompt), media_type="application/x-ndjson")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
