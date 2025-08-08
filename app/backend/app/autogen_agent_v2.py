@@ -16,6 +16,11 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(os.path.dir
 
 # Configuration flag
 ENABLE_MCP_TOOLS = os.getenv("ENABLE_MCP_TOOLS", "true").lower() == "true"
+ENABLE_AZURE_MCP = os.getenv("ENABLE_AZURE_MCP", "true").lower() == "true"
+ENABLE_AZURE_DEVOPS_MCP = os.getenv("ENABLE_AZURE_DEVOPS_MCP", "true").lower() == "true"
+ENABLE_GITHUB_MCP = os.getenv("ENABLE_GITHUB_MCP", "true").lower() == "true"
+ENABLE_PLAYWRIGHT_MCP = os.getenv("ENABLE_PLAYWRIGHT_MCP", "true").lower() == "true"
+USE_OFFICIAL_GITHUB_MCP = os.getenv("USE_OFFICIAL_GITHUB_MCP", "true").lower() == "true"
 
 
 def create_mcp_server_params() -> List[StdioServerParams]:
@@ -28,29 +33,42 @@ def create_mcp_server_params() -> List[StdioServerParams]:
 
     # Azure MCP server parameters
     try:
-        print("🔄 Creating Azure MCP server params...")
-        azure_server_params = StdioServerParams(
-            command="npx",
-            args=["-y", "@azure/mcp@latest", "server", "start"],
-            env=os.environ.copy(),
-        )
-        server_params.append(azure_server_params)
-        print("✅ Azure MCP server params created")
+        if ENABLE_AZURE_MCP:
+            print("🔄 Creating Azure MCP server params...")
+            azure_server_params = StdioServerParams(
+                command="npx",
+                args=["-y", "@azure/mcp@latest", "server", "start"],
+                env=os.environ.copy(),
+                read_timeout_seconds=90,
+            )
+            server_params.append(azure_server_params)
+            print("✅ Azure MCP server params created")
+        else:
+            print("⏭️  Skipping Azure MCP: disabled by ENABLE_AZURE_MCP=false")
     except Exception as e:
         print(f"❌ Azure MCP server params creation failed: {e}")
 
-    # Azure DevOps MCP server parameters (requires ADO_ORG)
+    # Azure DevOps MCP server parameters (requires ADO_ORG and PAT)
     try:
         ado_org = os.getenv("ADO_ORG")
-        if ado_org:
+        ado_pat = os.getenv("ADO_PAT") or os.getenv("AZURE_DEVOPS_EXT_PAT")
+        if ENABLE_AZURE_DEVOPS_MCP and ado_org and ado_pat:
             print("🔄 Creating Azure DevOps MCP server params...")
+            current_env = os.environ.copy()
+            # Both env names are commonly used; set both for safety
+            current_env["ADO_PAT"] = ado_pat
+            current_env["AZURE_DEVOPS_EXT_PAT"] = ado_pat
+
             ado_server_params = StdioServerParams(
                 command="npx",
                 args=["-y", "@azure-devops/mcp", ado_org],
-                env=os.environ.copy(),
+                env=current_env,
+                read_timeout_seconds=45,
             )
             server_params.append(ado_server_params)
             print("✅ Azure DevOps MCP server params created")
+        elif ENABLE_AZURE_DEVOPS_MCP and ado_org and not ado_pat:
+            print("⏭️  Skipping Azure DevOps MCP: missing ADO_PAT/AZURE_DEVOPS_EXT_PAT")
         else:
             print("❌ ADO_ORG not set - skipping Azure DevOps MCP")
     except Exception as e:
@@ -60,36 +78,59 @@ def create_mcp_server_params() -> List[StdioServerParams]:
     # GitHub MCP server parameters (with environment variables)
     try:
         github_token = os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN")
-        if github_token:
+        if ENABLE_GITHUB_MCP and github_token:
             print("🔄 Creating GitHub MCP server params...")
             print(f"🔑 GitHub token found: {github_token[:8]}...")
 
             current_env = os.environ.copy()
             current_env["GITHUB_PERSONAL_ACCESS_TOKEN"] = github_token
+            current_env["GITHUB_TOKEN"] = github_token
+            current_env["GH_TOKEN"] = github_token
 
-            github_server_params = StdioServerParams(
-                command="npx",
-                args=["github-mcp-custom", "stdio"],
-                env=current_env,
-            )
+            if USE_OFFICIAL_GITHUB_MCP:
+                # Prefer official MCP GitHub server binary
+                github_server_params = StdioServerParams(
+                    command="server-github",
+                    args=[],
+                    env=current_env,
+                    read_timeout_seconds=45,
+                )
+            else:
+                # Run custom server via node to avoid npx dynamic installs and ensure path
+                github_server_params = StdioServerParams(
+                    command="node",
+                    args=[
+                        "/usr/local/lib/node_modules/github-mcp-custom/bin/index.js",
+                        "stdio",
+                    ],
+                    env=current_env,
+                    read_timeout_seconds=45,
+                )
             server_params.append(github_server_params)
             print("✅ GitHub MCP server params created (npx-based with token)")
         else:
-            print("❌ GITHUB_PERSONAL_ACCESS_TOKEN not set - skipping GitHub MCP")
+            if not ENABLE_GITHUB_MCP:
+                print("⏭️  Skipping GitHub MCP: disabled by ENABLE_GITHUB_MCP=false")
+            else:
+                print("❌ GITHUB_PERSONAL_ACCESS_TOKEN not set - skipping GitHub MCP")
     except Exception as e:
         print(f"❌ GitHub MCP server params creation failed: {e}")
         print("🔄 Continuing without GitHub MCP server")
 
     # Playwright MCP server (web browsing)
     try:
-        print("🔄 Creating Playwright MCP server params...")
-        pw_params = StdioServerParams(
-            command="npx",
-            args=["@playwright/mcp@latest", "--headless"],
-            env=os.environ.copy(),
-        )
-        server_params.append(pw_params)
-        print("✅ Playwright MCP server params created")
+        if ENABLE_PLAYWRIGHT_MCP:
+            print("🔄 Creating Playwright MCP server params...")
+            pw_params = StdioServerParams(
+                command="npx",
+                args=["@playwright/mcp@latest", "--headless"],
+                env=os.environ.copy(),
+                read_timeout_seconds=45,
+            )
+            server_params.append(pw_params)
+            print("✅ Playwright MCP server params created")
+        else:
+            print("⏭️  Skipping Playwright MCP: disabled by ENABLE_PLAYWRIGHT_MCP=false")
     except Exception as e:
         print(f"❌ Playwright MCP server params creation failed: {e}")
 
@@ -164,22 +205,33 @@ async def stream_task(prompt: str) -> AsyncGenerator[str, None]:
         for i, params in enumerate(params_list):
             try:
                 wb = McpWorkbench(params)
-                # Give each MCP actor a dedicated startup window to avoid races
-                await stack.enter_async_context(wb)
+                # Give each MCP actor a dedicated startup window to avoid races and avoid hanging
+                try:
+                    await asyncio.wait_for(stack.enter_async_context(wb), timeout=10)
+                except asyncio.TimeoutError:
+                    raise RuntimeError("Workbench startup timed out")
+
                 if hasattr(wb, "initialize"):
-                    await wb.initialize()
-                # Retry tool listing a couple times to absorb slow-start servers
-                last_err: Optional[Exception] = None
-                for _ in range(3):
                     try:
-                        await wb.list_tools()
+                        await asyncio.wait_for(wb.initialize(), timeout=8)
+                    except asyncio.TimeoutError:
+                        raise RuntimeError("Workbench initialization timed out")
+
+                # Retry tool listing a couple times to absorb slow-start servers, with per-try timeout
+                last_err: Optional[Exception] = None
+                is_azure = any("@azure/mcp" in str(a).lower() for a in getattr(params, "args", []))
+                attempts = 6 if is_azure else 4
+                per_try_timeout = 45 if is_azure else 20
+                for _ in range(attempts):
+                    try:
+                        await asyncio.wait_for(wb.list_tools(), timeout=per_try_timeout)
                         last_err = None
                         break
                     except Exception as e:
                         last_err = e
                         await asyncio.sleep(0.5)
                 if last_err is not None:
-                    raise last_err
+                    raise RuntimeError(f"list_tools failed after retries: {last_err}")
                 workbenches.append(wb)
                 args_str = " ".join(str(a) for a in getattr(params, "args", [])).lower()
                 if "@azure/mcp" in args_str:
@@ -195,7 +247,15 @@ async def stream_task(prompt: str) -> AsyncGenerator[str, None]:
                     bench_indices["playwright"] = i
                     yield "✅ Playwright MCP connected\n"
             except Exception as e:
-                yield f"⚠️  Failed to connect a MCP server: {e}\n"
+                args_str = " ".join(str(a) for a in getattr(params, "args", [])).lower()
+                which = "azure" if "@azure/mcp" in args_str else (
+                    "ado" if "azure-devops" in args_str else (
+                        "github" if "github" in args_str else (
+                            "playwright" if "@playwright/mcp" in args_str else "unknown"
+                        )
+                    )
+                )
+                yield f"⚠️  Failed to connect {which} MCP server: {e}\n"
 
         # Build participants
         participants: List[AssistantAgent | UserProxyAgent] = []
@@ -405,4 +465,58 @@ async def stream_task(prompt: str) -> AsyncGenerator[str, None]:
                     yield f"{str(update)}\n"
         except Exception as e:
             yield f"❌ Execution error: {e}\n"
+
+
+async def check_mcp_servers() -> List[dict]:
+    """Quick diagnostic: try to start each configured MCP workbench and return status list."""
+    results: List[dict] = []
+    params_list = create_mcp_server_params()
+    async with AsyncExitStack() as stack:
+        for params in params_list:
+            args_list = getattr(params, "args", [])
+            args_str = " ".join(str(a) for a in args_list).lower()
+            is_azure = "@azure/mcp" in args_str
+
+            entry = {
+                "args": args_list,
+                "status": "unknown",
+                "error": None,
+            }
+            try:
+                wb = McpWorkbench(params)
+                # Allow slower startup/handshake for Azure server
+                startup_timeout = 20 if is_azure else 10
+                init_timeout = 15 if is_azure else 8
+                try:
+                    await asyncio.wait_for(stack.enter_async_context(wb), timeout=startup_timeout)
+                except asyncio.TimeoutError:
+                    raise RuntimeError("startup timeout")
+
+                if hasattr(wb, "initialize"):
+                    try:
+                        await asyncio.wait_for(wb.initialize(), timeout=init_timeout)
+                    except asyncio.TimeoutError:
+                        raise RuntimeError("initialize timeout")
+
+                # Retry list_tools with per-try timeout to accommodate first-run warmup
+                attempts = 6 if is_azure else 3
+                per_try_timeout = 45 if is_azure else 12
+                last_err: Optional[Exception] = None
+                for _ in range(attempts):
+                    try:
+                        await asyncio.wait_for(wb.list_tools(), timeout=per_try_timeout)
+                        last_err = None
+                        break
+                    except Exception as e:
+                        last_err = e
+                        await asyncio.sleep(0.5)
+                if last_err is not None:
+                    raise RuntimeError(f"list_tools failed after retries: {last_err}")
+
+                entry["status"] = "ok"
+            except Exception as e:
+                entry["status"] = "error"
+                entry["error"] = str(e)
+            results.append(entry)
+    return results
 

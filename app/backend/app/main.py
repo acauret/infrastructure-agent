@@ -6,7 +6,7 @@ import asyncio
 import os
 
 # Reuse the existing autogen entrypoint
-from app.backend.app.autogen_agent_v2 import create_mcp_server_params, stream_task
+from app.backend.app.autogen_agent_v2 import create_mcp_server_params, stream_task, check_mcp_servers
 
 app = FastAPI(title="Infrastructure Agent API")
 
@@ -37,5 +37,14 @@ async def stream_agent_output(prompt: str):
 async def run(req: RunRequest):
     try:
         return StreamingResponse(stream_agent_output(req.prompt), media_type="text/plain")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/mcp-check")
+async def mcp_check():
+    try:
+        results = await check_mcp_servers()
+        return {"results": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
