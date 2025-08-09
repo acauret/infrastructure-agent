@@ -22,20 +22,26 @@ export function ChatMessage({ role, content }: { role: ChatRole; content: string
           remarkPlugins={[remarkGfm]}
           rehypePlugins={[rehypeRaw]}
           components={{
-            a: (props) => <a {...props} className="text-sky-600 underline" />,
-            code: (props) => (
+            a: (props: React.AnchorHTMLAttributes<HTMLAnchorElement>) => (
+              <a {...props} className="text-sky-600 underline" />
+            ),
+            code: (props: React.HTMLAttributes<HTMLElement>) => (
               <code {...props} className="rounded bg-slate-100 px-1 py-0.5 text-[0.85em]" />
             ),
-            pre: (props) => (
+            pre: (props: React.HTMLAttributes<HTMLPreElement>) => (
               <pre {...props} className="overflow-auto rounded-md bg-slate-900 p-3 text-slate-100" />
             ),
-            table: (props) => (
+            table: (props: React.TableHTMLAttributes<HTMLTableElement>) => (
               <div className="overflow-x-auto">
                 <table {...props} className="w-full text-left text-sm" />
               </div>
             ),
-            th: (props) => <th {...props} className="border-b border-slate-200 px-2 py-1 font-medium" />,
-            td: (props) => <td {...props} className="border-b border-slate-50 px-2 py-1" />,
+            th: (props: React.ThHTMLAttributes<HTMLTableCellElement>) => (
+              <th {...props} className="border-b border-slate-200 px-2 py-1 font-medium" />
+            ),
+            td: (props: React.TdHTMLAttributes<HTMLTableCellElement>) => (
+              <td {...props} className="border-b border-slate-50 px-2 py-1" />
+            ),
           }}
         >
           {content}

@@ -6,10 +6,12 @@ import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 import { Send, Square, Zap, Globe, GitBranch } from 'lucide-react'
 import { ChatMessage } from '@/components/chat-message'
+import { ToolEventCard } from '@/components/tool-event'
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000'
+const API_BASE = (((globalThis as any)?.process?.env?.NEXT_PUBLIC_API_BASE) as string) || 'http://localhost:8000'
 
-type Message = { role: 'user' | 'assistant' | 'tool'; content: string }
+type ToolEvent = { kind: 'call' | 'result'; agent?: string; items: any[] }
+type Message = { role: 'user' | 'assistant' | 'tool'; content: string; tool?: ToolEvent }
 
 export default function Page() {
   const [input, setInput] = useState<string>('List Azure subscriptions; then check git repos user:acauret type:private')
@@ -91,23 +93,17 @@ export default function Page() {
           }
           case 'tool_call': {
             const calls = evt?.calls ?? (evt?.name ? [{ name: evt.name, arguments: evt?.arguments }] : [])
-            let pretty = ''
-            try { pretty = JSON.stringify(calls, null, 2) } catch { pretty = String(calls) }
-            const header = `Tool call${evt?.agent ? ` (${evt.agent})` : ''}`
             setMessages((prev: Array<Message>) => [
               ...prev,
-              { role: 'tool', content: `${header}\n\n\`\`\`json\n${pretty}\n\`\`\`` },
+              { role: 'tool', content: '', tool: { kind: 'call', agent: evt?.agent, items: calls } },
             ])
             break
           }
           case 'tool_result': {
             const results = evt?.results ?? (evt?.output ? [{ output: evt.output }] : [])
-            let pretty = ''
-            try { pretty = JSON.stringify(results, null, 2) } catch { pretty = String(results) }
-            const header = `Tool result${evt?.agent ? ` (${evt.agent})` : ''}`
             setMessages((prev: Array<Message>) => [
               ...prev,
-              { role: 'tool', content: `${header}\n\n\`\`\`json\n${pretty}\n\`\`\`` },
+              { role: 'tool', content: '', tool: { kind: 'result', agent: evt?.agent, items: results } },
             ])
             break
           }
@@ -191,7 +187,11 @@ export default function Page() {
           ) : (
             messages.map((m: Message, i: number) => (
               <div key={i}>
-                <ChatMessage role={m.role} content={m.content} />
+                {m.role === 'tool' && m.tool ? (
+                  <ToolEventCard kind={m.tool.kind} agent={m.tool.agent} items={m.tool.items} maxPreview={1} />
+                ) : (
+                  <ChatMessage role={m.role} content={m.content} />
+                )}
               </div>
             ))
           )}
