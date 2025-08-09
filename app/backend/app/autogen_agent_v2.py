@@ -116,6 +116,8 @@ def create_mcp_server_params() -> List[StdioServerParams]:
             current_env["GITHUB_PERSONAL_ACCESS_TOKEN"] = github_token
             current_env["GITHUB_TOKEN"] = github_token
             current_env["GH_TOKEN"] = github_token
+            # Some servers expect MCP_GITHUB_TOKEN explicitly
+            current_env["MCP_GITHUB_TOKEN"] = github_token
 
             if USE_OFFICIAL_GITHUB_MCP:
                 # Prefer Node entrypoint for official server; fallback to PATH binary
@@ -316,17 +318,24 @@ async def stream_task(prompt: str) -> AsyncGenerator[str, None]:
                             raise RuntimeError(f"list_tools failed after retries: {last_err}")
 
                         workbenches.append(wb)
-                        args_str = " ".join(str(a) for a in getattr(params, "args", [])).lower()
-                        if "@azure/mcp" in args_str:
+                        args_list = getattr(params, "args", [])
+                        args_str = " ".join(str(a) for a in args_list).lower()
+                        cmd_str = str(getattr(params, "command", "")).lower()
+                        if "@azure/mcp" in args_str or "@azure/mcp" in cmd_str:
                             bench_indices["azure"] = i
                             ctx.emit({"type": "status", "text": "Azure MCP connected"})
-                        elif "@azure-devops/mcp" in args_str or "azure-devops" in args_str:
+                        elif "@azure-devops/mcp" in args_str or "azure-devops" in args_str or "@azure-devops/mcp" in cmd_str:
                             bench_indices["ado"] = i
                             ctx.emit({"type": "status", "text": "Azure DevOps MCP connected"})
-                        elif "github-mcp" in args_str or "server-github" in args_str:
+                        elif (
+                            "github-mcp" in args_str or
+                            "server-github" in args_str or
+                            "server-github" in cmd_str or
+                            "/@modelcontextprotocol/server-github/" in args_str
+                        ):
                             bench_indices["github"] = i
                             ctx.emit({"type": "status", "text": "GitHub MCP connected"})
-                        elif "@playwright/mcp" in args_str:
+                        elif "@playwright/mcp" in args_str or "@playwright/mcp" in cmd_str:
                             bench_indices["playwright"] = i
                             ctx.emit({"type": "status", "text": "Playwright MCP connected"})
                     except Exception as e:
@@ -356,7 +365,16 @@ async def stream_task(prompt: str) -> AsyncGenerator[str, None]:
 
                             Be concise. Immediately delegate the smallest actionable task to the correct agent and present results briefly.
                             For Azure requests like "list subscriptions", assign directly to AzureAgent with the precise action (e.g., "subscription_list").
-                            {"For GitHub queries (repositories, issues, PRs), assign to GitHubAgent." if has_github else "If GitHub tools are unavailable, state that briefly."}
+                            {"For GitHub queries (repositories, issues, PRs), assign to GitHubAgent and REQUIRE it to call at least one GitHub MCP tool before replying. Never accept answers without a tool_result." if has_github else "If GitHub tools are unavailable, state that briefly and do not guess results."}
+
+                            For queries like "check git repos user:<name> type:private":
+                            - Instruct GitHubAgent to list repositories for that user using GitHub MCP tools and filter for private.
+                            - Do not summarize or guess; wait for a GitHub tool_result.
+
+                            Mixed prompts (e.g., "List Azure subscriptions; then check GitHub repos user:<name>") must be executed sequentially:
+                            1) Assign Azure task to AzureAgent.
+                            2) After Azure tool_result, assign the GitHub task to GitHubAgent.
+                            Do not summarize GitHub info unless a GitHub tool_result has been produced in this session.
 
                             Only say "TERMINATE" when all tasks are done and you've provided a short final summary.
                             """,
@@ -403,7 +421,18 @@ async def stream_task(prompt: str) -> AsyncGenerator[str, None]:
                             workbench=workbenches[bench_indices["github"]],
                             model_client_stream=True,
                             max_tool_iterations=10,
-                            system_message="Use GitHub tools; do not invent data.",
+                            system_message="""
+                            You are a GitHub analysis expert with access to GitHub MCP tools.
+
+                            MANDATORY: You MUST call the appropriate GitHub MCP tool(s) for any repository or user query.
+                            - Do NOT guess or recall from memory.
+                            - Do NOT produce any repository list, issue list, or details unless you include at least one tool_result from a GitHub tool in this session.
+                            - Prefer listing repositories for the specified user and visibility (e.g., private) using the available tool(s).
+
+                            If GitHub tools are unavailable, state that limitation clearly and stop instead of guessing.
+
+                            When assigned, acknowledge briefly, run the tool(s), then present the real results as a concise table with clickable links.
+                            """,
                         )
                     )
 
