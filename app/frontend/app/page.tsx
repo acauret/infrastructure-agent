@@ -75,13 +75,24 @@ export default function Page() {
             break
           }
           case 'message': {
-            const content = typeof evt?.text === 'string' ? evt.text : ''
-            setMessages((prev: Array<Message>) => [...prev, { role: 'assistant', content }])
+            const contentRaw = typeof evt?.text === 'string' ? evt.text : ''
+            const content = contentRaw.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
+            if (!content) break
+            setMessages((prev: Array<Message>) => {
+              const last = prev[prev.length - 1]
+              // If we were streaming chunks already, merge the final message into the last assistant bubble
+              if (last && last.role === 'assistant') {
+                return [...prev.slice(0, -1), { role: 'assistant', content: (last.content || '') + (content.startsWith('\n') ? '' : '\n') + content }]
+              }
+              return [...prev, { role: 'assistant', content }]
+            })
             break
           }
           case 'chunk': {
-            const delta = typeof evt?.text === 'string' ? evt.text : ''
-            if (!delta) break
+            const d = typeof evt?.text === 'string' ? evt.text : ''
+            // Normalize and drop chunks that are only whitespace to avoid large gaps
+            const delta = d.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n')
+            if (!delta.trim()) break
             setMessages((prev: Array<Message>) => {
               const last = prev[prev.length - 1]
               if (last && last.role === 'assistant') {

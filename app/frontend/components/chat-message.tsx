@@ -10,11 +10,17 @@ export type ChatRole = 'user' | 'assistant' | 'tool'
 
 export function ChatMessage({ role, content }: { role: ChatRole; content: string }) {
   const isUser = role === 'user'
+  // Normalize excessive whitespace to avoid huge gaps in rendering
+  const sanitized = content
+    .replace(/\r\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/[\t ]+\n/g, '\n')
+    .trimEnd()
   return (
     <div className={clsx('flex w-full', isUser ? 'justify-end' : 'justify-start')}>
       <div
         className={clsx(
-          'max-w-[85%] whitespace-pre-wrap rounded-2xl px-4 py-3 text-sm shadow-sm transition-colors',
+          'max-w-[85%] rounded-2xl px-4 py-3 text-sm shadow-sm transition-colors',
           isUser ? 'bg-sky-600 text-white' : 'bg-white text-slate-800 border border-slate-200'
         )}
       >
@@ -44,7 +50,7 @@ export function ChatMessage({ role, content }: { role: ChatRole; content: string
             ),
           }}
         >
-          {content}
+          {sanitized}
         </ReactMarkdown>
       </div>
     </div>
