@@ -6,7 +6,7 @@ import asyncio
 import os
 
 # Reuse the existing autogen entrypoint
-from app.backend.app.autogen_agent_v2 import create_mcp_server_params, stream_task, check_mcp_servers
+from app.backend.app.autogen_agent_v2 import create_mcp_server_params, stream_task, check_mcp_servers, submit_user_input
 
 app = FastAPI(title="Infrastructure Agent API")
 
@@ -23,6 +23,12 @@ app.add_middleware(
 
 class RunRequest(BaseModel):
     prompt: str
+    # Optional session id to continue a conversation (not required for one-shot)
+    session: str | None = None
+
+class InputRequest(BaseModel):
+    session: str
+    text: str
 
 @app.get("/health")
 async def health():
@@ -49,3 +55,11 @@ async def mcp_check():
         return {"results": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/input")
+async def input_to_session(req: InputRequest):
+    ok = await submit_user_input(req.session, req.text)
+    if not ok:
+        raise HTTPException(status_code=404, detail="session not found")
+    return {"status": "ok"}

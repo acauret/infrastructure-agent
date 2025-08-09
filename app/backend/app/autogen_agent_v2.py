@@ -1,4 +1,5 @@
 import os
+import shutil
 from typing import AsyncGenerator, Dict, List, Optional, Tuple
 import asyncio
 import uuid
@@ -22,6 +23,34 @@ ENABLE_AZURE_DEVOPS_MCP = os.getenv("ENABLE_AZURE_DEVOPS_MCP", "true").lower() =
 ENABLE_GITHUB_MCP = os.getenv("ENABLE_GITHUB_MCP", "true").lower() == "true"
 ENABLE_PLAYWRIGHT_MCP = os.getenv("ENABLE_PLAYWRIGHT_MCP", "true").lower() == "true"
 USE_OFFICIAL_GITHUB_MCP = os.getenv("USE_OFFICIAL_GITHUB_MCP", "true").lower() == "true"
+
+# Simple session registry for streaming + human-in-the-loop
+class _StreamContext:
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.outgoing: asyncio.Queue[Optional[str]] = asyncio.Queue()
+        self.input_q: asyncio.Queue[str] = asyncio.Queue()
+
+    def emit(self, obj: Dict) -> None:
+        # Always include session id in events
+        payload = dict(obj)
+        payload.setdefault("session", self.session_id)
+        line = json.dumps(payload) + "\n"
+        # Non-blocking put
+        try:
+            self.outgoing.put_nowait(line)
+        except asyncio.QueueFull:
+            # Best-effort; should not happen with default size
+            pass
+
+_SESSIONS: Dict[str, _StreamContext] = {}
+
+async def submit_user_input(session_id: str, text: str) -> bool:
+    ctx = _SESSIONS.get(session_id)
+    if not ctx:
+        return False
+    await ctx.input_q.put(text)
+    return True
 
 
 def create_mcp_server_params() -> List[StdioServerParams]:
@@ -89,13 +118,25 @@ def create_mcp_server_params() -> List[StdioServerParams]:
             current_env["GH_TOKEN"] = github_token
 
             if USE_OFFICIAL_GITHUB_MCP:
-                # Prefer official MCP GitHub server binary
-                github_server_params = StdioServerParams(
-                    command="server-github",
-                    args=[],
-                    env=current_env,
-                    read_timeout_seconds=45,
-                )
+                # Prefer Node entrypoint for official server; fallback to PATH binary
+                entry = "/usr/local/lib/node_modules/@modelcontextprotocol/server-github/dist/index.js"
+                if os.path.exists(entry):
+                    github_server_params = StdioServerParams(
+                        command="node",
+                        args=[entry, "stdio"],
+                        env=current_env,
+                        read_timeout_seconds=45,
+                    )
+                else:
+                    bin_path = shutil.which("server-github")
+                    if not bin_path:
+                        raise RuntimeError("server-github not found; ensure global npm install or set USE_OFFICIAL_GITHUB_MCP=false")
+                    github_server_params = StdioServerParams(
+                        command=bin_path,
+                        args=[],
+                        env=current_env,
+                        read_timeout_seconds=45,
+                    )
             else:
                 # Run custom server via node to avoid npx dynamic installs and ensure path
                 github_server_params = StdioServerParams(
@@ -122,14 +163,51 @@ def create_mcp_server_params() -> List[StdioServerParams]:
     try:
         if ENABLE_PLAYWRIGHT_MCP:
             print("🔄 Creating Playwright MCP server params...")
-            pw_params = StdioServerParams(
-                command="npx",
-                args=["@playwright/mcp@latest", "--headless"],
-                env=os.environ.copy(),
-                read_timeout_seconds=45,
-            )
-            server_params.append(pw_params)
-            print("✅ Playwright MCP server params created")
+            # Prefer globally installed CLI to avoid npx dynamic install at runtime
+            # Try override, then common bin names, then direct node path fallback.
+            pw_env_bin = os.getenv("PLAYWRIGHT_MCP_BIN")
+            candidate_bins = [
+                pw_env_bin,
+                "/usr/local/bin/playwright-mcp",
+                "/usr/local/bin/mcp-playwright",
+                "playwright-mcp",
+                "mcp-playwright",
+            ]
+
+            # Prefer node module entrypoint for stability; it's present when npm -g installed
+            node_entry = "/usr/local/lib/node_modules/@playwright/mcp/dist/index.js"
+            chosen_command = None
+            chosen_args = ["--headless"]
+
+            if os.path.exists(node_entry):
+                chosen_command = "node"
+                chosen_args = [node_entry, "--headless"]
+            else:
+                for cand in candidate_bins:
+                    if not cand:
+                        continue
+                    # If absolute path, require it to exist; if bare, verify via PATH
+                    if cand.startswith("/"):
+                        if os.path.exists(cand):
+                            chosen_command = cand
+                            break
+                    else:
+                        found = shutil.which(cand)
+                        if found:
+                            chosen_command = found
+                            break
+
+            if chosen_command is None:
+                print("⏭️  Skipping Playwright MCP: CLI not found; set PLAYWRIGHT_MCP_BIN to override")
+            else:
+                pw_params = StdioServerParams(
+                    command=chosen_command,
+                    args=chosen_args,
+                    env=os.environ.copy(),
+                    read_timeout_seconds=60,
+                )
+                server_params.append(pw_params)
+                print(f"✅ Playwright MCP server params created (command: {chosen_command})")
         else:
             print("⏭️  Skipping Playwright MCP: disabled by ENABLE_PLAYWRIGHT_MCP=false")
     except Exception as e:
@@ -139,7 +217,11 @@ def create_mcp_server_params() -> List[StdioServerParams]:
 
 
 async def stream_task(prompt: str) -> AsyncGenerator[str, None]:
-    """Run the MagenticOne team for a single prompt and stream updates as NDJSON events."""
+    """Run the MagenticOne team for a single prompt and stream updates as NDJSON events with session support."""
+    req_id = uuid.uuid4().hex[:8]
+    ctx = _StreamContext(req_id)
+    _SESSIONS[req_id] = ctx
+
     # Model config
     azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
     api_key = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_KEY")
@@ -148,524 +230,308 @@ async def stream_task(prompt: str) -> AsyncGenerator[str, None]:
     deployment = os.getenv("AZURE_DEPLOYMENT_NAME", model_name)
 
     if not azure_endpoint or not api_key:
-        yield json.dumps({"type": "error", "text": "Missing AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_API_KEY"}) + "\n"
-        return
-
-    # Termination conditions
-    termination = TextMentionTermination("TERMINATE") | MaxMessageTermination(max_messages=30)
-
-    # Create model client
-    model_client = AzureOpenAIChatCompletionClient(
-        azure_endpoint=azure_endpoint,
-        api_key=api_key,
-        api_version=api_version,
-        azure_deployment=deployment,
-        model=model_name,
-    )
-
-    # Ensure Azure CLI login for ADO server if credentials are present
-    async def ensure_azure_cli_login() -> None:
-        client_id = os.getenv("AZURE_CLIENT_ID")
-        client_secret = os.getenv("AZURE_CLIENT_SECRET")
-        tenant_id = os.getenv("AZURE_TENANT_ID")
-        if not (client_id and client_secret and tenant_id):
-            return
+        ctx.emit({"type": "error", "text": "Missing AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_API_KEY"})
+        # Terminate stream early
         try:
-            show = await asyncio.create_subprocess_exec(
-                "az", "account", "show",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await show.wait()
-            if show.returncode == 0:
+            ctx.outgoing.put_nowait(None)
+        except Exception:
+            pass
+    else:
+        # Termination conditions
+        termination = TextMentionTermination("TERMINATE") | MaxMessageTermination(max_messages=30)
+
+        # Create model client
+        model_client = AzureOpenAIChatCompletionClient(
+            azure_endpoint=azure_endpoint,
+            api_key=api_key,
+            api_version=api_version,
+            azure_deployment=deployment,
+            model=model_name,
+        )
+
+        async def ensure_azure_cli_login() -> None:
+            client_id = os.getenv("AZURE_CLIENT_ID")
+            client_secret = os.getenv("AZURE_CLIENT_SECRET")
+            tenant_id = os.getenv("AZURE_TENANT_ID")
+            if not (client_id and client_secret and tenant_id):
                 return
-        except Exception:
-            pass
-        try:
-            login = await asyncio.create_subprocess_exec(
-                "az", "login", "--service-principal",
-                "-u", client_id, "-p", client_secret,
-                "--tenant", tenant_id,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await login.wait()
-        except Exception:
-            # Best-effort
-            pass
-
-    await ensure_azure_cli_login()
-
-    # Prepare MCP workbenches
-    params_list = create_mcp_server_params()
-    bench_indices: Dict[str, int] = {}
-    workbenches: List[McpWorkbench] = []
-
-    async with AsyncExitStack() as stack:
-        # Create and enter workbenches
-        for i, params in enumerate(params_list):
             try:
-                wb = McpWorkbench(params)
-                try:
-                    await asyncio.wait_for(stack.enter_async_context(wb), timeout=10)
-                except asyncio.TimeoutError:
-                    raise RuntimeError("Workbench startup timed out")
+                show = await asyncio.create_subprocess_exec(
+                    "az", "account", "show",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await show.wait()
+                if show.returncode == 0:
+                    return
+            except Exception:
+                pass
+            try:
+                login = await asyncio.create_subprocess_exec(
+                    "az", "login", "--service-principal",
+                    "-u", client_id, "-p", client_secret,
+                    "--tenant", tenant_id,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await login.wait()
+            except Exception:
+                pass
 
-                if hasattr(wb, "initialize"):
-                    try:
-                        await asyncio.wait_for(wb.initialize(), timeout=8)
-                    except asyncio.TimeoutError:
-                        raise RuntimeError("Workbench initialization timed out")
+    async def run_team_and_emit() -> None:
+            await ensure_azure_cli_login()
 
-                # Retry tool listing with per-try timeout
-                last_err: Optional[Exception] = None
-                is_azure = any("@azure/mcp" in str(a).lower() for a in getattr(params, "args", []))
-                attempts = 6 if is_azure else 4
-                per_try_timeout = 45 if is_azure else 20
-                for _ in range(attempts):
+            params_list = create_mcp_server_params()
+            bench_indices: Dict[str, int] = {}
+            workbenches: List[McpWorkbench] = []
+
+            async with AsyncExitStack() as stack:
+                for i, params in enumerate(params_list):
                     try:
-                        await asyncio.wait_for(wb.list_tools(), timeout=per_try_timeout)
-                        last_err = None
-                        break
+                        wb = McpWorkbench(params)
+                        try:
+                            await asyncio.wait_for(stack.enter_async_context(wb), timeout=10)
+                        except asyncio.TimeoutError:
+                            raise RuntimeError("Workbench startup timed out")
+
+                        if hasattr(wb, "initialize"):
+                            try:
+                                await asyncio.wait_for(wb.initialize(), timeout=8)
+                            except asyncio.TimeoutError:
+                                raise RuntimeError("Workbench initialization timed out")
+
+                        last_err: Optional[Exception] = None
+                        is_azure = any("@azure/mcp" in str(a).lower() for a in getattr(params, "args", []))
+                        attempts = 6 if is_azure else 4
+                        per_try_timeout = 45 if is_azure else 20
+                        for _ in range(attempts):
+                            try:
+                                await asyncio.wait_for(wb.list_tools(), timeout=per_try_timeout)
+                                last_err = None
+                                break
+                            except Exception as e:
+                                last_err = e
+                                await asyncio.sleep(0.5)
+                        if last_err is not None:
+                            raise RuntimeError(f"list_tools failed after retries: {last_err}")
+
+                        workbenches.append(wb)
+                        args_str = " ".join(str(a) for a in getattr(params, "args", [])).lower()
+                        if "@azure/mcp" in args_str:
+                            bench_indices["azure"] = i
+                            ctx.emit({"type": "status", "text": "Azure MCP connected"})
+                        elif "@azure-devops/mcp" in args_str or "azure-devops" in args_str:
+                            bench_indices["ado"] = i
+                            ctx.emit({"type": "status", "text": "Azure DevOps MCP connected"})
+                        elif "github-mcp" in args_str or "server-github" in args_str:
+                            bench_indices["github"] = i
+                            ctx.emit({"type": "status", "text": "GitHub MCP connected"})
+                        elif "@playwright/mcp" in args_str:
+                            bench_indices["playwright"] = i
+                            ctx.emit({"type": "status", "text": "Playwright MCP connected"})
                     except Exception as e:
-                        last_err = e
-                        await asyncio.sleep(0.5)
-                if last_err is not None:
-                    raise RuntimeError(f"list_tools failed after retries: {last_err}")
+                        ctx.emit({"type": "status", "text": f"Failed to connect MCP server: {e}"})
+                        continue
 
-                workbenches.append(wb)
-                args_str = " ".join(str(a) for a in getattr(params, "args", [])).lower()
-                if "@azure/mcp" in args_str:
-                    bench_indices["azure"] = i
-                    yield json.dumps({"type": "status", "text": "Azure MCP connected"}) + "\n"
-                elif "@azure-devops/mcp" in args_str or "azure-devops" in args_str:
-                    bench_indices["ado"] = i
-                    yield json.dumps({"type": "status", "text": "Azure DevOps MCP connected"}) + "\n"
-                elif "github-mcp" in args_str or "server-github" in args_str:
-                    bench_indices["github"] = i
-                    yield json.dumps({"type": "status", "text": "GitHub MCP connected"}) + "\n"
-                elif "@playwright/mcp" in args_str:
-                    bench_indices["playwright"] = i
-                    yield json.dumps({"type": "status", "text": "Playwright MCP connected"}) + "\n"
-            except Exception as e:
-                yield json.dumps({"type": "status", "text": f"Failed to connect MCP server: {e}"}) + "\n"
+                participants: List[AssistantAgent | UserProxyAgent] = []
 
-        # Build participants
-        participants: List[AssistantAgent | UserProxyAgent] = []
-        req_id = uuid.uuid4().hex[:8]
+                has_github = "github" in bench_indices
+                has_playwright = "playwright" in bench_indices
+                has_infracoder = bool(has_github)
 
-        has_github = "github" in bench_indices
-        has_playwright = "playwright" in bench_indices
-        has_infracoder = bool(has_github)
+                team_description = "AzureAgent: Handles Azure infrastructure queries and commands"
+                if has_github:
+                    team_description += "\n                        GitHubAgent: Handles GitHub repository analysis"
+                if has_infracoder:
+                    team_description += "\n                        InfraCoderAgent: Handles Terraform/Bicep coding tasks with branching and PRs"
 
-        team_description = "AzureAgent: Handles Azure infrastructure queries and commands"
-        if has_github:
-            team_description += "\n                        GitHubAgent: Handles GitHub repository analysis"
-        if has_infracoder:
-            team_description += "\n                        InfraCoderAgent: Handles Terraform/Bicep coding tasks with branching and PRs"
-
-        coordinator_agent = AssistantAgent(
-            name=f"MagenticOneOrchestrator_{req_id}",
-            description="Coordinates tasks between available agents.",
-            model_client=model_client,
-            system_message=f"""
-                    You are a MagenticOne coordinator agent for Azure infrastructure and analysis.
-                    Team members available:
-                        {team_description}
-
-                    Be concise. Immediately delegate the smallest actionable task to the correct agent and present results briefly.
-                    For Azure requests like "list subscriptions", assign directly to AzureAgent with the precise action (e.g., "subscription_list").
-                    {"For GitHub queries (repositories, issues, PRs), assign to GitHubAgent." if has_github else "If GitHub tools are unavailable, state that briefly."}
-
-                    Only say "TERMINATE" when all tasks are done and you've provided a short final summary.
-                    """,
-        )
-        participants.append(coordinator_agent)
-
-        azure_agent = AssistantAgent(
-            name=f"AzureAgent_{req_id}",
-            description="Azure infrastructure analysis and management.",
-            model_client=model_client,
-            workbench=workbenches[bench_indices["azure"]] if "azure" in bench_indices else None,
-            model_client_stream=True,
-            max_tool_iterations=10,
-            system_message="""
-                    You are an Azure infrastructure expert with access to live Azure MCP tools.
-
-                    MANDATORY: You MUST use your available Azure MCP tools to get actual data from the user's Azure account. 
-                    NEVER provide generic instructions about Azure CLI, PowerShell, or Portal usage.
-                    NEVER provide example or fictional data.
-                    ALWAYS call the actual MCP tools available to you.
-
-                    When asked about Azure subscriptions:
-                    1. IMMEDIATELY call the "subscription" function/tool that is available to you
-                    2. Use arguments like {"command": "list", "parameters": {}} or {"learn": true}
-                    3. Wait for the real results from the tool call
-                    4. Format the actual returned data as a clean table:
-                       | Subscription Name | Subscription ID | State | Tenant ID |
-                    5. Present only the real data returned by the tool
-
-                    For any Azure request:
-                    - First call the appropriate MCP tool (subscription, group, storage, etc.)
-                    - Use the real data returned
-                    - Format results clearly
-                    - Never suggest manual methods or provide generic instructions
-
-                    You have access to live Azure MCP tools. Use them immediately for every request.
-                    
-                    When the MagenticOneOrchestrator assigns you a task, acknowledge and execute it immediately.
-                    """,
-        )
-        participants.append(azure_agent)
-
-        if "ado" in bench_indices:
-            participants.append(
-                AssistantAgent(
-                    name=f"AdoAgent_{req_id}",
-                    description="Azure DevOps operations (Projects, Repos, PRs, Work Items, Builds, Releases).",
+                coordinator_agent = AssistantAgent(
+                    name=f"MagenticOneOrchestrator_{req_id}",
+                    description="Coordinates tasks between available agents.",
                     model_client=model_client,
-                    workbench=workbenches[bench_indices["ado"]],
+                    system_message=f"""
+                            You are a MagenticOne coordinator agent for Azure infrastructure and analysis.
+                            Team members available:
+                                {team_description}
+
+                            Be concise. Immediately delegate the smallest actionable task to the correct agent and present results briefly.
+                            For Azure requests like "list subscriptions", assign directly to AzureAgent with the precise action (e.g., "subscription_list").
+                            {"For GitHub queries (repositories, issues, PRs), assign to GitHubAgent." if has_github else "If GitHub tools are unavailable, state that briefly."}
+
+                            Only say "TERMINATE" when all tasks are done and you've provided a short final summary.
+                            """,
+                )
+                participants.append(coordinator_agent)
+
+                azure_agent = AssistantAgent(
+                    name=f"AzureAgent_{req_id}",
+                    description="Azure infrastructure analysis and management.",
+                    model_client=model_client,
+                    workbench=workbenches[bench_indices["azure"]] if "azure" in bench_indices else None,
                     model_client_stream=True,
                     max_tool_iterations=10,
                     system_message="""
-                            You are an Azure DevOps expert with access to live Azure DevOps MCP tools.
-                            Always call the available tools for Projects, Repos, Pull Requests, Work Items, Builds, and Releases.
-                            Return real data only; do not invent.
+                            You are an Azure infrastructure expert with access to live Azure MCP tools.
+
+                            MANDATORY: You MUST use your available Azure MCP tools to get actual data from the user's Azure account. 
+                            NEVER provide generic instructions about Azure CLI, PowerShell, or Portal usage.
+                            NEVER provide example or fictional data.
+                            ALWAYS call the actual MCP tools available to you.
                             """,
                 )
-            )
+                participants.append(azure_agent)
 
-        if "github" in bench_indices:
-            participants.append(
-                AssistantAgent(
-                    name=f"GitHubAgent_{req_id}",
-                    description="GitHub repository analysis and operations.",
-                    model_client=model_client,
-                    workbench=workbenches[bench_indices["github"]],
-                    model_client_stream=True,
-                    max_tool_iterations=10,
-                    system_message="""
-                            You are a GitHub repository analysis expert.
+                if "ado" in bench_indices:
+                    participants.append(
+                        AssistantAgent(
+                            name=f"AdoAgent_{req_id}",
+                            description="Azure DevOps operations (Projects, Repos, PRs, Work Items, Builds, Releases).",
+                            model_client=model_client,
+                            workbench=workbenches[bench_indices["ado"]],
+                            model_client_stream=True,
+                            max_tool_iterations=10,
+                            system_message="Always use the available ADO tools and return real data only.",
+                        )
+                    )
 
-                            When asked about repositories:
-                            1. List repositories with details
-                            2. Analyze code structure
-                            3. Review issues and pull requests
-                            4. Provide insights on repository health
+                if "github" in bench_indices:
+                    participants.append(
+                        AssistantAgent(
+                            name=f"GitHubAgent_{req_id}",
+                            description="GitHub repository analysis and operations.",
+                            model_client=model_client,
+                            workbench=workbenches[bench_indices["github"]],
+                            model_client_stream=True,
+                            max_tool_iterations=10,
+                            system_message="Use GitHub tools; do not invent data.",
+                        )
+                    )
 
-                            Always use actual data from GitHub tools when available.
-                            If GitHub MCP tools are not accessible, politely explain the limitation.
-                            
-                            When the MagenticOneOrchestrator assigns you a task, acknowledge and execute it immediately.
-                            """,
+                if "playwright" in bench_indices and "github" in bench_indices:
+                    participants.append(
+                        AssistantAgent(
+                            name=f"InfraCoderAgent_{req_id}",
+                            description="Terraform/Bicep coding tasks; browse AVM modules; PR workflow.",
+                            model_client=model_client,
+                            workbench=[
+                                workbenches[bench_indices["github"]],
+                                workbenches[bench_indices["playwright"]],
+                            ],
+                            model_client_stream=True,
+                            max_tool_iterations=15,
+                            system_message="Use Playwright to browse AVM docs; use GitHub for repo ops.",
+                        )
+                    )
+
+                if "playwright" in bench_indices:
+                    participants.append(
+                        AssistantAgent(
+                            name=f"WebAgent_{req_id}",
+                            description="Web browsing and scraping using Playwright MCP.",
+                            model_client=model_client,
+                            workbench=workbenches[bench_indices["playwright"]],
+                            model_client_stream=True,
+                            max_tool_iterations=10,
+                            system_message="Browse as needed and cite URLs.",
+                        )
+                    )
+
+                # Interactive user proxy bridged to our session input queue
+                async def input_bridge(prompt_text: str, cancellation_token) -> str:
+                    try:
+                        ctx.emit({"type": "input_request", "prompt": prompt_text})
+                        text = await ctx.input_q.get()
+                        return text
+                    except Exception as e:
+                        ctx.emit({"type": "error", "text": f"input error: {e}"})
+                        return ""
+
+                participants.append(
+                    UserProxyAgent(
+                        name=f"HumanUser_{req_id}",
+                        description="Human user",
+                        input_func=input_bridge,
+                    )
                 )
-            )
 
-        if "playwright" in bench_indices and "github" in bench_indices:
-            participants.append(
-                AssistantAgent(
-                    name=f"InfraCoderAgent_{req_id}",
-                    description="Terraform/Bicep coding tasks; browse AVM modules; PR workflow.",
-                    model_client=model_client,
-                    workbench=[
-                        workbenches[bench_indices["github"]],
-                        workbenches[bench_indices["playwright"]],
-                    ],
-                    model_client_stream=True,
-                    max_tool_iterations=15,
-                    system_message="""
-                            You are an infrastructure-as-code engineer specializing in Terraform and Bicep.
-                            Your responsibilities:
-                            - Discover and reference latest Azure Verified Modules (AVM):
-                              Terraform: https://azure.github.io/Azure-Verified-Modules/indexes/terraform/tf-resource-modules/
-                              Bicep:    https://azure.github.io/Azure-Verified-Modules/indexes/bicep/bicep-resource-modules/
-                              Use the Playwright MCP tools to browse these pages when needed and extract authoritative guidance.
-                            - Analyze a target repository (structure, modules, conventions). Use GitHub MCP tools to search, read files, and inspect branches.
-                            - Implement changes following best practices (naming, tags, variables/parameters, README updates).
-                            - Workflow for repo changes (via GitHub MCP tools):
-                              1) Create a new branch named: feature/avm-<resource>-<yyyyMMdd>-<shortid>
-                              2) Add or modify files with minimal diffs and clear structure.
-                              3) Commit with conventional message, e.g.: feat(<area>): add <resource> with AVM best practices
-                              4) Open a Pull Request with a concise summary, checklist, and references to AVM docs.
-                            - Validate: plan or lint if tools are available; otherwise explain validation steps for the maintainer.
-                            - If required inputs are missing (repository, paths, resource details), propose a minimal plan and ask only for the essential missing fields.
-
-                            Important rules:
-                            - Prefer AVM modules where suitable; otherwise follow Microsoft Azure Terraform/Bicep guidance.
-                            - Do not include secrets. Use variables/parameters and document them.
-                            - Keep edits focused; avoid unrelated refactors unless explicitly requested.
-                            - Use available MCP tools only; do not invent tool names.
-                            """,
-                )
-            )
-
-        if "playwright" in bench_indices:
-            participants.append(
-                AssistantAgent(
-                    name=f"WebAgent_{req_id}",
-                    description="Web browsing and scraping using Playwright MCP.",
-                    model_client=model_client,
-                    workbench=workbenches[bench_indices["playwright"]],
-                    model_client_stream=True,
-                    max_tool_iterations=10,
-                    system_message="""
-                            You are a web browsing assistant using Playwright MCP tools.
-                            Use tools to navigate, click, type, extract content, and answer questions from the live web.
-                            Only browse when needed and cite the page URLs in your responses.
-                            """,
-                )
-            )
-
-        participants.append(UserProxyAgent(name=f"HumanUser_{req_id}", description="Human user"))
-
-        team = MagenticOneGroupChat(
-            participants=participants,
-            model_client=model_client,
-            termination_condition=termination,
-        )
-
-        # Announce request
-        yield json.dumps({"type": "request", "role": "user", "text": prompt}) + "\n"
-        yield json.dumps({"type": "status", "text": "Starting..."}) + "\n"
-
-        try:
-            async for update in team.run_stream(task=prompt):
                 try:
-                    msg_type = getattr(update, "type", None) or type(update).__name__
-                    src = getattr(update, "source", None) or "system"
-                    content = getattr(update, "content", None)
-                    if content is None:
-                        content = str(update)
-                    # Token stream
-                    if ("Chunk" in msg_type) or msg_type.endswith("ChunkEvent"):
-                        yield json.dumps({"type": "chunk", "agent": src, "text": str(content)}) + "\n"
-                        continue
-                    # Text message
-                    if "TextMessage" in msg_type:
-                        yield json.dumps({"type": "message", "agent": src, "text": str(content)}) + "\n"
-                        continue
-                    # Tool call request
-                    if "ToolCallRequestEvent" in msg_type:
-                        calls = getattr(update, "content", []) or []
-                        serializable = []
-                        for c in calls:
-                            serializable.append({
-                                "name": getattr(c, "name", None),
-                                "arguments": getattr(c, "arguments", None),
-                            })
-                        yield json.dumps({"type": "tool_call", "agent": src, "calls": serializable}) + "\n"
-                        continue
-                    # Tool call execution result
-                    if "ToolCallExecutionEvent" in msg_type:
-                        results = getattr(update, "content", []) or []
-                        serializable = []
-                        for r in results:
-                            name = getattr(r, "name", None)
-                            out = getattr(r, "content", None)
-                            out_str = str(out) if out is not None else ""
-                            try:
-                                parsed = json.loads(out_str)
-                            except Exception:
-                                parsed = out_str
-                            serializable.append({"name": name, "output": parsed})
-                        yield json.dumps({"type": "tool_result", "agent": src, "results": serializable}) + "\n"
-                        continue
-                    # Fallback event
-                    yield json.dumps({"type": "event", "agent": src, "name": msg_type, "text": str(content)}) + "\n"
-                except Exception as ie:
-                    yield json.dumps({"type": "event", "agent": "system", "name": "error", "text": str(ie)}) + "\n"
-        except Exception as e:
-            yield json.dumps({"type": "error", "text": str(e)}) + "\n"
-
-        if "ado" in bench_indices:
-            participants.append(
-                AssistantAgent(
-                    name=f"AdoAgent_{req_id}",
-                    description="Azure DevOps operations (Projects, Repos, PRs, Work Items, Builds, Releases).",
-                    model_client=model_client,
-                    workbench=workbenches[bench_indices["ado"]],
-                    model_client_stream=True,
-                    max_tool_iterations=10,
-                    system_message="""
-                            You are an Azure DevOps expert with access to live Azure DevOps MCP tools.
-                            Always call the available tools for Projects, Repos, Pull Requests, Work Items, Builds, and Releases.
-                            Return real data only; do not invent.
-                            """,
-                )
-            )
-
-        if "github" in bench_indices:
-            participants.append(
-                AssistantAgent(
-                    name=f"GitHubAgent_{req_id}",
-                    description="GitHub repository analysis and operations.",
-                    model_client=model_client,
-                    workbench=workbenches[bench_indices["github"]],
-                    model_client_stream=True,
-                    max_tool_iterations=10,
-                    system_message="""
-                            You are a GitHub repository analysis expert.
-
-                            When asked about repositories:
-                            1. List repositories with details
-                            2. Analyze code structure
-                            3. Review issues and pull requests
-                            4. Provide insights on repository health
-
-                            Always use actual data from GitHub tools when available.
-                            If GitHub MCP tools are not accessible, politely explain the limitation.
-                            
-                            When the MagenticOneOrchestrator assigns you a task, acknowledge and execute it immediately.
-                            """,
-                )
-            )
-
-        if "playwright" in bench_indices and "github" in bench_indices:
-            participants.append(
-                AssistantAgent(
-                    name=f"InfraCoderAgent_{req_id}",
-                    description="Terraform/Bicep coding tasks; browse AVM modules; PR workflow.",
-                    model_client=model_client,
-                    workbench=[
-                        workbenches[bench_indices["github"]],
-                        workbenches[bench_indices["playwright"]],
-                    ],
-                    model_client_stream=True,
-                    max_tool_iterations=15,
-                    system_message="""
-                            You are an infrastructure-as-code engineer specializing in Terraform and Bicep.
-                            Your responsibilities:
-                            - Discover and reference latest Azure Verified Modules (AVM):
-                              Terraform: https://azure.github.io/Azure-Verified-Modules/indexes/terraform/tf-resource-modules/
-                              Bicep:    https://azure.github.io/Azure-Verified-Modules/indexes/bicep/bicep-resource-modules/
-                              Use the Playwright MCP tools to browse these pages when needed and extract authoritative guidance.
-                            - Analyze a target repository (structure, modules, conventions). Use GitHub MCP tools to search, read files, and inspect branches.
-                            - Implement changes following best practices (naming, tags, variables/parameters, README updates).
-                            - Workflow for repo changes (via GitHub MCP tools):
-                              1) Create a new branch named: feature/avm-<resource>-<yyyyMMdd>-<shortid>
-                              2) Add or modify files with minimal diffs and clear structure.
-                              3) Commit with conventional message, e.g.: feat(<area>): add <resource> with AVM best practices
-                              4) Open a Pull Request with a concise summary, checklist, and references to AVM docs.
-                            - Validate: plan or lint if tools are available; otherwise explain validation steps for the maintainer.
-                            - If required inputs are missing (repository, paths, resource details), propose a minimal plan and ask only for the essential missing fields.
-
-                            Important rules:
-                            - Prefer AVM modules where suitable; otherwise follow Microsoft Azure Terraform/Bicep guidance.
-                            - Do not include secrets. Use variables/parameters and document them.
-                            - Keep edits focused; avoid unrelated refactors unless explicitly requested.
-                            - Use available MCP tools only; do not invent tool names.
-                            """,
-                )
-            )
-
-        if "playwright" in bench_indices:
-            participants.append(
-                AssistantAgent(
-                    name=f"WebAgent_{req_id}",
-                    description="Web browsing and scraping using Playwright MCP.",
-                    model_client=model_client,
-                    workbench=workbenches[bench_indices["playwright"]],
-                    model_client_stream=True,
-                    max_tool_iterations=10,
-                    system_message="""
-                            You are a web browsing assistant using Playwright MCP tools.
-                            Use tools to navigate, click, type, extract content, and answer questions from the live web.
-                            Only browse when needed and cite the page URLs in your responses.
-                            """,
-                )
-            )
-
-        participants.append(UserProxyAgent(name=f"HumanUser_{req_id}", description="Human user"))
-
-        team = MagenticOneGroupChat(
-            participants=participants,
-            model_client=model_client,
-            termination_condition=termination,
-        )
-
-        # Compact, markdown-friendly start
-        yield f"### Request\n- User: {prompt}\n\n### Run\n"
-        try:
-            # Buffer token chunks to avoid one-token-per-line
-            chunk_buffer = ""
-            prev_was_chunk = False
-
-            async for update in team.run_stream(task=prompt):
-                try:
-                    msg_type = getattr(update, "type", None) or type(update).__name__
-                    src = getattr(update, "source", None) or "system"
-                    content = getattr(update, "content", None)
-                    if content is None:
-                        content = str(update)
-                    if not isinstance(content, str):
-                        content = str(content)
-
-                    # Chunk events → buffer
-                    is_chunk = ("Chunk" in msg_type) or msg_type.endswith("ChunkEvent")
-                    if is_chunk:
-                        chunk_buffer += content
-                        prev_was_chunk = True
-                        continue
-
-                    # Flush buffered chunks once when type switches
-                    if prev_was_chunk and chunk_buffer:
-                        yield chunk_buffer + "\n"
-                        chunk_buffer = ""
-                        prev_was_chunk = False
-
-                    pretty = None
-                    # Text messages → "- Agent: content" with indentation for multiline
-                    if "TextMessage" in msg_type:
-                        text = content.strip()
-                        if "\n" in text:
-                            first, *rest = text.split("\n")
-                            body = first + "\n" + "\n".join(f"  {line}" for line in rest)
-                        else:
-                            body = text
-                        pretty = f"- {src}: {body}\n"
-
-                    # Tool call requests → compact, single-line summary per call
-                    elif "ToolCallRequestEvent" in msg_type:
-                        lines = []
-                        calls = getattr(update, "content", []) or []
-                        for c in calls:
-                            name = getattr(c, "name", None) or "(unknown)"
-                            args = getattr(c, "arguments", None)
-                            args_str = str(args) if args is not None else "{}"
-                            if len(args_str) > 200:
-                                args_str = args_str[:200] + "…"
-                            lines.append(f"- {src} → tool: {name} `{args_str}`")
-                        pretty = ("\n".join(lines) + "\n") if lines else None
-
-                    # Tool execution results → pretty JSON block, truncated
-                    elif "ToolCallExecutionEvent" in msg_type:
-                        blocks = []
-                        results = getattr(update, "content", []) or []
-                        for r in results:
-                            name = getattr(r, "name", None) or "(unknown)"
-                            out = getattr(r, "content", None)
-                            out_str = str(out) if out is not None else ""
-                            pretty_json = None
-                            try:
-                                loaded = json.loads(out_str)
-                                pretty_json = json.dumps(loaded, indent=2)
-                            except Exception:
-                                pretty_json = out_str
-                            if pretty_json and len(pretty_json) > 1500:
-                                pretty_json = pretty_json[:1500] + "\n… (truncated)"
-                            blocks.append(f"- {src} → result: {name}\n```json\n{pretty_json}\n```")
-                        pretty = ("\n".join(blocks) + "\n") if blocks else None
-
-                    if pretty is None:
-                        pretty = f"- {src}: {content}\n"
-
-                    yield pretty
+                    names = [getattr(p, "name", "?") for p in participants]
+                    ctx.emit({"type": "status", "text": f"Participants: {', '.join(names)}"})
                 except Exception:
-                    yield f"{str(update)}\n"
-            if prev_was_chunk and chunk_buffer:
-                yield chunk_buffer + "\n"
-        except Exception as e:
-            yield f"❌ Execution error: {e}\n"
+                    pass
+
+                team = MagenticOneGroupChat(
+                    participants=participants,
+                    model_client=model_client,
+                    termination_condition=termination,
+                )
+
+                ctx.emit({"type": "request", "role": "user", "text": prompt})
+                ctx.emit({"type": "status", "text": "Starting..."})
+
+                try:
+                    async for update in team.run_stream(task=prompt):
+                        try:
+                            msg_type = getattr(update, "type", None) or type(update).__name__
+                            src = getattr(update, "source", None) or "system"
+                            content = getattr(update, "content", None)
+                            if content is None:
+                                content = str(update)
+                            if ("Chunk" in msg_type) or msg_type.endswith("ChunkEvent"):
+                                ctx.emit({"type": "chunk", "agent": src, "text": str(content)})
+                                continue
+                            if "TextMessage" in msg_type:
+                                ctx.emit({"type": "message", "agent": src, "text": str(content)})
+                                continue
+                            if "ToolCallRequestEvent" in msg_type:
+                                calls = getattr(update, "content", []) or []
+                                serializable = []
+                                for c in calls:
+                                    serializable.append({
+                                        "name": getattr(c, "name", None),
+                                        "arguments": getattr(c, "arguments", None),
+                                    })
+                                ctx.emit({"type": "tool_call", "agent": src, "calls": serializable})
+                                continue
+                            if "ToolCallExecutionEvent" in msg_type:
+                                results = getattr(update, "content", []) or []
+                                serializable = []
+                                for r in results:
+                                    name = getattr(r, "name", None)
+                                    out = getattr(r, "content", None)
+                                    out_str = str(out) if out is not None else ""
+                                    try:
+                                        parsed = json.loads(out_str)
+                                    except Exception:
+                                        parsed = out_str
+                                    serializable.append({"name": name, "output": parsed})
+                                ctx.emit({"type": "tool_result", "agent": src, "results": serializable})
+                                continue
+                            ctx.emit({"type": "event", "agent": src, "name": msg_type, "text": str(content)})
+                        except Exception as ie:
+                            ctx.emit({"type": "event", "agent": "system", "name": "error", "text": str(ie)})
+                except Exception as e:
+                    ctx.emit({"type": "error", "text": str(e)})
+            # Signal completion
+            try:
+                ctx.outgoing.put_nowait(None)
+            except Exception:
+                pass
+
+        # Kick off team in background
+    asyncio.create_task(run_team_and_emit())
+
+    # Emit the session id first so the client can correlate
+    ctx.emit({"type": "session", "id": req_id})
+    # Now stream lines from the outgoing queue
+    try:
+        while True:
+            line = await ctx.outgoing.get()
+            if line is None:
+                break
+            yield line
+    finally:
+        _SESSIONS.pop(req_id, None)
 
 
 async def check_mcp_servers() -> List[dict]:

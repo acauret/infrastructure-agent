@@ -26,9 +26,8 @@ services:
       ENABLE_AZURE_MCP: "true"
       ENABLE_AZURE_DEVOPS_MCP: "true"
       ENABLE_GITHUB_MCP: "true"
-      ENABLE_PLAYWRIGHT_MCP: "true"
-      # Set to true to use the official MCP GitHub server instead of github-mcp-custom
-      USE_OFFICIAL_GITHUB_MCP: "false"
+      ENABLE_PLAYWRIGHT_MCP: "false" # enable when Playwright MCP CLI is confirmed present
+      USE_OFFICIAL_GITHUB_MCP: "true" # Prefer official MCP GitHub server for stability
   frontend:
     build:
       context: ..

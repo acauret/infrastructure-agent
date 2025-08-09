@@ -16,6 +16,9 @@ export default function Page() {
   const [messages, setMessages] = useState<Array<Message>>([])
   const [isLoading, setIsLoading] = useState(false)
   const [status, setStatus] = useState<string>('')
+  const [sessionId, setSessionId] = useState<string | null>(null)
+  const [pendingInputPrompt, setPendingInputPrompt] = useState<string | null>(null)
+  const [pendingInputText, setPendingInputText] = useState<string>('')
   const abortRef = useRef<AbortController | null>(null)
 
   const scrollRef = useRef<HTMLDivElement | null>(null)
@@ -54,12 +57,21 @@ export default function Page() {
       const handleEvent = (evt: any) => {
         const t = evt?.type
         switch (t) {
+          case 'session':
+            if (typeof evt?.id === 'string') setSessionId(evt.id)
+            break
           case 'status':
             setStatus(evt?.text ?? '')
             break
           case 'request':
             // Backend also emits the user prompt; we already rendered it.
             break
+          case 'input_request': {
+            const prompt = typeof evt?.prompt === 'string' ? evt.prompt : 'Input requested'
+            setPendingInputPrompt(prompt)
+            setPendingInputText('')
+            break
+          }
           case 'message': {
             const content = typeof evt?.text === 'string' ? evt.text : ''
             setMessages((prev: Array<Message>) => [...prev, { role: 'assistant', content }])
@@ -140,6 +152,25 @@ export default function Page() {
 
   const handleStop = () => abortRef.current?.abort()
 
+  const submitPendingInput = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!sessionId) return
+    const text = pendingInputText.trim()
+    if (!text) return
+    try {
+      await fetch(`${API_BASE}/input`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session: sessionId, text }),
+      })
+      setPendingInputPrompt(null)
+      setPendingInputText('')
+      setMessages((prev: Array<Message>) => [...prev, { role: 'user', content: text }])
+    } catch (err) {
+      setStatus('Failed to send input')
+    }
+  }
+
   return (
     <div className="flex h-[calc(100vh-8rem)] flex-col rounded-2xl border border-slate-200 bg-white shadow-sm">
       {/* Top status bar */}
@@ -168,7 +199,7 @@ export default function Page() {
       </CardContent>
 
       {/* Composer */}
-      <div className="border-t border-slate-200 bg-white p-3">
+      <div className="border-t border-slate-200 bg-white p-3 space-y-2">
         <form onSubmit={handleSubmit} className="mx-auto grid max-w-3xl grid-cols-[1fr_auto_auto] items-start gap-2">
           <Textarea
             value={input}
@@ -190,6 +221,20 @@ export default function Page() {
             <Square className="mr-2 h-4 w-4" /> Stop
           </Button>
         </form>
+
+        {pendingInputPrompt && (
+          <form onSubmit={submitPendingInput} className="mx-auto grid max-w-3xl grid-cols-[1fr_auto] items-start gap-2">
+            <Textarea
+              value={pendingInputText}
+              onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) => setPendingInputText(e.target.value)}
+              placeholder={pendingInputPrompt}
+              className="min-h-[44px] max-h-40 border-amber-300"
+            />
+            <Button type="submit" disabled={!sessionId} className="h-[44px] bg-amber-600 hover:bg-amber-700">
+              Reply
+            </Button>
+          </form>
+        )}
       </div>
     </div>
   )
